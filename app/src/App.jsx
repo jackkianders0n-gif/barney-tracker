@@ -3,7 +3,7 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "rec
 
 // !! IMPORTANT: After deploying the worker, replace this with your worker URL !!
 // e.g. https://barney-tracker-api.YOUR-SUBDOMAIN.workers.dev
-const WORKER_URL = "https://barney-tracker-api.YOUR-SUBDOMAIN.workers.dev";
+const WORKER_URL = "https://barney-tracker-api.barneythebigdog.workers.dev";
 
 const api = {
   get: (path) => fetch(`${WORKER_URL}${path}`).then(r => r.json()),
