@@ -2,9 +2,6 @@ import { useState, useEffect, useCallback } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 
 const WORKER_URL = "https://barney-tracker-api.barneythebigdog.workers.dev";
-const GOOGLE_CLIENT_ID = "367028371700-oqiilok6tgej5enleq9ch0nide00pn5p.apps.googleusercontent.com";
-const GOOGLE_SCOPES = "https://www.googleapis.com/auth/calendar";
-const GOOGLE_CALENDAR_ID = "primary";
 
 const api = {
   get:  (path)       => fetch(`${WORKER_URL}${path}`).then(r => r.json()),
@@ -13,10 +10,11 @@ const api = {
   del:  (path)       => fetch(`${WORKER_URL}${path}`, { method:"DELETE" }).then(r => r.json()),
 };
 
+// All Google Calendar calls go through the Worker — no tokens needed in the app
 const gcal = {
-  get:  (path, token)       => fetch(`https://www.googleapis.com/calendar/v3${path}`, { headers:{ Authorization:`Bearer ${token}` } }).then(r => r.json()),
-  post: (path, token, body) => fetch(`https://www.googleapis.com/calendar/v3${path}`, { method:"POST", headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" }, body:JSON.stringify(body) }).then(r => r.json()),
-  del:  (path, token)       => fetch(`https://www.googleapis.com/calendar/v3${path}`, { method:"DELETE", headers:{ Authorization:`Bearer ${token}` } }),
+  events: (timeMin, timeMax)   => api.get(`/api/gcal/events?timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}`),
+  create: (body)               => api.post("/api/gcal/events", body),
+  delete: (id)                 => api.del(`/api/gcal/events/${id}`),
 };
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
@@ -231,10 +229,9 @@ export default function BarneyApp() {
   const [loading, setLoading]   = useState(true);
   const [saving, setSaving]     = useState(false);
 
-  // Google auth
-  const [gToken, setGToken]               = useState(null);
-  const [gTokenClient, setGTokenClient]   = useState(null);
-  const [gAuthLoading, setGAuthLoading]   = useState(false);
+  // Google Calendar connection status
+  const [calConnected, setCalConnected] = useState(false);
+  const [calChecked, setCalChecked]     = useState(false);
 
   // Data
   const [feeding, setFeeding]       = useState([]);
@@ -273,19 +270,21 @@ export default function BarneyApp() {
   const [groomType, setGroomType]   = useState(GROOMING_TYPES[0]); const [groomNote, setGroomNote] = useState(""); const [groomNextAppt, setGroomNextAppt] = useState(""); const [treatmentDates, setTreatmentDates] = useState({ fleaDate:"", wormDate:"" });
   const [selMood, setSelMood]       = useState("happy"); const [moodNote, setMoodNote] = useState("");
 
-  // Load Google Identity Services
+  // Check if Google Calendar is already connected
   useEffect(() => {
-    const script = document.createElement("script");
-    script.src = "https://accounts.google.com/gsi/client";
-    script.async = true;
-    script.onload = () => {
-      const client = window.google.accounts.oauth2.initTokenClient({
-        client_id: GOOGLE_CLIENT_ID, scope: GOOGLE_SCOPES,
-        callback: (resp) => { if (resp.access_token) { setGToken(resp.access_token); setGAuthLoading(false); } },
-      });
-      setGTokenClient(client);
-    };
-    document.head.appendChild(script);
+    api.get("/api/auth/status").then(r => {
+      setCalConnected(!!r.connected);
+      setCalChecked(true);
+    }).catch(() => setCalChecked(true));
+    // Handle redirect back from Google OAuth
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("auth") === "success") {
+      setCalConnected(true);
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    if (params.get("auth") === "error") {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
   }, []);
 
   // Load app data
@@ -310,25 +309,21 @@ export default function BarneyApp() {
     load();
   }, []);
 
-  // Load Google Calendar
-  const loadGCal = useCallback(async (token, anchor) => {
-    if (!token) return;
+  // Load Google Calendar via Worker proxy
+  const loadGCal = useCallback(async (anchor) => {
+    if (!calConnected) return;
     setCalLoading(true);
     try {
       const dates = getWeekDates(anchor);
-      // Load wider range (4 weeks back, 4 weeks forward) so "last known" works on home
       const timeMin = new Date(dates[0].getTime() - 28*86400000).toISOString();
       const timeMax = new Date(dates[6].getTime() + 28*86400000).toISOString();
-      const res = await gcal.get(
-        `/calendars/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/events?timeMin=${timeMin}&timeMax=${timeMax}&singleEvents=true&orderBy=startTime`,
-        token
-      );
-      setGCalEvents((res.items||[]).filter(e => e.summary?.startsWith("🐾 Barney")));
+      const events = await gcal.events(timeMin, timeMax);
+      setGCalEvents(Array.isArray(events) ? events : []);
     } catch(e) { console.error(e); }
     setCalLoading(false);
-  }, []);
+  }, [calConnected]);
 
-  useEffect(() => { if (gToken) loadGCal(gToken, weekAnchor); }, [gToken, weekAnchor, loadGCal]);
+  useEffect(() => { if (calConnected) loadGCal(weekAnchor); }, [calConnected, weekAnchor, loadGCal]);
 
   const s = async (fn) => { setSaving(true); try { await fn(); } finally { setSaving(false); } };
 
@@ -348,15 +343,18 @@ export default function BarneyApp() {
   const logMood       = () => s(async () => { await api.post("/api/mood", { mood:selMood, logged_by:"App", note:moodNote }); setMood(await api.get("/api/mood")); setMoodNote(""); });
 
   const addGCalEvent = () => s(async () => {
-    if (!gToken) { alert("Connect Google Calendar first"); return; }
-    await gcal.post(`/calendars/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/events`, gToken, buildGCalEvent(newLoc, selectedDay, newStart, newEnd, allDay, newEventNote));
-    await loadGCal(gToken, weekAnchor);
+    if (!calConnected) { alert("Connect Google Calendar first"); return; }
+    await gcal.create(buildGCalEvent(newLoc, selectedDay, newStart, newEnd, allDay, newEventNote));
+    await loadGCal(weekAnchor);
     setShowAddEvent(false); setNewEventNote(""); setAllDay(false);
   });
   const deleteGCalEvent = (id) => s(async () => {
-    if (!gToken) return;
-    await gcal.del(`/calendars/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/events/${id}`, gToken);
+    await gcal.delete(id);
     setGCalEvents(p=>p.filter(e=>e.id!==id));
+  });
+  const disconnectGCal = () => s(async () => {
+    await api.post("/api/auth/disconnect", {});
+    setCalConnected(false); setGCalEvents([]);
   });
 
   // ── COMPUTED ──
@@ -376,8 +374,7 @@ export default function BarneyApp() {
   const selectedDayEvents = gCalEvents.filter(e=>(e.start?.date||e.start?.dateTime?.slice(0,10))===selectedDay).sort((a,b)=>(a.start?.dateTime||"").localeCompare(b.start?.dateTime||""));
 
   // Current location: active event NOW, else most recent past event
-  const nowMs = Date.now();
-  const currentEvent = gCalEvents.find(e => {
+  const currentEvent = calConnected ? gCalEvents.find(e => {
     const d = e.start?.date||e.start?.dateTime?.slice(0,10);
     if (d!==today) return false;
     if (e.start?.date) return true;
@@ -474,7 +471,7 @@ export default function BarneyApp() {
             </div>
 
             {/* Today's upcoming events */}
-            {gToken && gCalEvents.filter(e=>(e.start?.date||e.start?.dateTime?.slice(0,10))===today).length>0 && (
+            {calConnected && gCalEvents.filter(e=>(e.start?.date||e.start?.dateTime?.slice(0,10))===today).length>0 && (
               <Card style={{ marginBottom:14 }}>
                 <div style={{ fontSize:12, fontWeight:700, color:"#1e293b", marginBottom:10 }}>📅 Today's plan</div>
                 {gCalEvents
@@ -552,20 +549,20 @@ export default function BarneyApp() {
         {/* ── CALENDAR ── */}
         {tab==="calendar" && (
           <div>
-            {!gToken ? (
+            {!calConnected ? (
               <Card style={{ textAlign:"center", padding:"32px 20px" }}>
                 <div style={{ fontSize:48, marginBottom:12 }}>📅</div>
                 <div style={{ fontSize:16, fontWeight:700, color:"#1e293b", marginBottom:8 }}>Connect Google Calendar</div>
-                <div style={{ fontSize:13, color:"#94a3b8", marginBottom:20, lineHeight:1.5 }}>Sign in with the shared Barney Google account to view and add calendar events.</div>
-                <Btn variant="google" onClick={()=>{ setGAuthLoading(true); gTokenClient?.requestAccessToken(); }} disabled={gAuthLoading}>
-                  {gAuthLoading?"Connecting…":"🔗 Connect Google Calendar"}
+                <div style={{ fontSize:13, color:"#94a3b8", marginBottom:20, lineHeight:1.5 }}>Sign in once with the shared Barney Google account — you'll never need to sign in again.</div>
+                <Btn variant="google" onClick={()=>{ window.location.href = `${WORKER_URL}/api/auth/google`; }}>
+                  🔗 Connect Google Calendar
                 </Btn>
               </Card>
             ) : (
               <>
                 <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
                   <span style={{ fontSize:12, color:"#10b981", fontWeight:600 }}>✅ Calendar connected</span>
-                  <button onClick={()=>setGToken(null)} style={{ background:"none", border:"none", fontSize:12, color:"#94a3b8", cursor:"pointer", fontWeight:500 }}>Disconnect</button>
+                  <button onClick={disconnectGCal} style={{ background:"none", border:"none", fontSize:12, color:"#94a3b8", cursor:"pointer", fontWeight:500 }}>Disconnect</button>
                 </div>
 
                 <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12 }}>
