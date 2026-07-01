@@ -83,10 +83,10 @@ export default {
         return json({ flea, worm });
       }
       if (path === "/api/treatments" && method === "POST") {
-        const { type, logged_by } = await request.json();
+        const { type, logged_by, treated_at } = await request.json();
         await db.prepare(
           "INSERT INTO treatments (type, treated_at, logged_by) VALUES (?, ?, ?)"
-        ).bind(type, new Date().toISOString(), logged_by).run();
+        ).bind(type, treated_at || new Date().toISOString(), logged_by).run();
         return json({ ok: true });
       }
 
