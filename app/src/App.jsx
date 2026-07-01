@@ -1,927 +1,955 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 
-// !! IMPORTANT: After deploying the worker, replace this with your worker URL !!
-// e.g. https://barney-tracker-api.YOUR-SUBDOMAIN.workers.dev
 const WORKER_URL = "https://barney-tracker-api.barneythebigdog.workers.dev";
+const GOOGLE_CLIENT_ID = "367028371700-oqiilok6tgej5enleq9ch0nide00pn5p.apps.googleusercontent.com";
+const GOOGLE_SCOPES = "https://www.googleapis.com/auth/calendar";
+const GOOGLE_CALENDAR_ID = "primary";
 
 const api = {
-  get: (path) => fetch(`${WORKER_URL}${path}`).then(r => r.json()),
-  post: (path, body) => fetch(`${WORKER_URL}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then(r => r.json()),
-  put: (path, body) => fetch(`${WORKER_URL}${path}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then(r => r.json()),
-  del: (path) => fetch(`${WORKER_URL}${path}`, { method: "DELETE" }).then(r => r.json()),
+  get:  (path)       => fetch(`${WORKER_URL}${path}`).then(r => r.json()),
+  post: (path, body) => fetch(`${WORKER_URL}${path}`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body) }).then(r => r.json()),
+  put:  (path, body) => fetch(`${WORKER_URL}${path}`, { method:"PUT",  headers:{"Content-Type":"application/json"}, body:JSON.stringify(body) }).then(r => r.json()),
+  del:  (path)       => fetch(`${WORKER_URL}${path}`, { method:"DELETE" }).then(r => r.json()),
+};
+
+const gcal = {
+  get:  (path, token)       => fetch(`https://www.googleapis.com/calendar/v3${path}`, { headers:{ Authorization:`Bearer ${token}` } }).then(r => r.json()),
+  post: (path, token, body) => fetch(`https://www.googleapis.com/calendar/v3${path}`, { method:"POST", headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" }, body:JSON.stringify(body) }).then(r => r.json()),
+  del:  (path, token)       => fetch(`https://www.googleapis.com/calendar/v3${path}`, { method:"DELETE", headers:{ Authorization:`Bearer ${token}` } }),
 };
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
 
-const USERS = ["Jack", "Jakey", "Mum"];
-
 const LOCATIONS = [
-  { id: "home",    label: "Home",             icon: "🏠", color: "#7C9E87" },
-  { id: "mum",     label: "Mum's house",      icon: "👵", color: "#C4845A" },
-  { id: "jakey",   label: "Jakey's flat",     icon: "👨", color: "#5A7EC4" },
-  { id: "daycare", label: "Doggy daycare",    icon: "🐾", color: "#A05AC4" },
-  { id: "walk",    label: "On a walk",        icon: "🦮", color: "#C4A85A" },
+  { id:"home",    label:"Home",          icon:"🏠", color:"#10b981" },
+  { id:"mum",     label:"Mum's house",   icon:"👵", color:"#f59e0b" },
+  { id:"jakey",   label:"Jakey's flat",  icon:"👨", color:"#3b82f6" },
+  { id:"daycare", label:"Doggy daycare", icon:"🐾", color:"#8b5cf6" },
+  { id:"walk",    label:"On a walk",     icon:"🦮", color:"#06b6d4" },
 ];
 const LOC_MAP = Object.fromEntries(LOCATIONS.map(l => [l.id, l]));
 
 const BEHAVIOUR_TYPES = ["Limping","Not eating","Scratching","Vomiting","Lethargy","Unusual behaviour","Other"];
 const GROOMING_TYPES  = ["Bath","Brush","Nail clip","Ear clean","Other"];
-const EXPENSE_CATS    = ["Food","Vet","Daycare","Grooming","Toys","Insurance","Other"];
-const MOODS           = [{ v:"happy", l:"Happy 😄" },{ v:"calm", l:"Calm 😌" },{ v:"anxious", l:"Anxious 😟" },{ v:"tired", l:"Tired 😴" },{ v:"hyper", l:"Hyper 🤪" }];
+const MOODS = [
+  { v:"happy",   l:"Happy",   e:"😄" },
+  { v:"calm",    l:"Calm",    e:"😌" },
+  { v:"anxious", l:"Anxious", e:"😟" },
+  { v:"tired",   l:"Tired",   e:"😴" },
+  { v:"hyper",   l:"Hyper",   e:"🤪" },
+];
 
-function todayStr() { return new Date().toISOString().slice(0, 10); }
+const NAV = [
+  { id:"home",     label:"Home",     icon:"🏠" },
+  { id:"calendar", label:"Calendar", icon:"📅" },
+  { id:"feed",     label:"Feeding",  icon:"🍽️" },
+  { id:"toilet",   label:"Toilet",   icon:"🌿" },
+  { id:"walks",    label:"Walks",    icon:"🦮" },
+  { id:"health",   label:"Health",   icon:"💊" },
+  { id:"vet",      label:"Vet",      icon:"🏥" },
+  { id:"grooming", label:"Grooming", icon:"✂️" },
+  { id:"info",     label:"Info",     icon:"📋" },
+];
+
+function todayStr() { return new Date().toISOString().slice(0,10); }
 function formatTime(iso) {
   if (!iso) return "—";
   const d = new Date(iso), today = new Date();
-  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const time = d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
   if (d.toDateString() === today.toDateString()) return `Today ${time}`;
   const days = Math.floor((today - d) / 86400000);
   if (days === 1) return `Yesterday ${time}`;
-  return d.toLocaleDateString([], { day: "numeric", month: "short" }) + " " + time;
+  return d.toLocaleDateString([], { day:"numeric", month:"short" }) + " " + time;
 }
-function formatDate(s) { if (!s) return "—"; return new Date(s + "T12:00:00").toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" }); }
+function formatDate(s) { if (!s) return "—"; return new Date(s+"T12:00:00").toLocaleDateString([],{ day:"numeric", month:"short", year:"numeric" }); }
 function daysSince(iso) { if (!iso) return null; return Math.floor((Date.now() - new Date(iso)) / 86400000); }
 function getWeekDates(anchor) {
   const d = new Date(anchor), day = d.getDay();
-  const mon = new Date(d); mon.setDate(d.getDate() - ((day + 6) % 7));
-  return Array.from({ length: 7 }, (_, i) => { const x = new Date(mon); x.setDate(mon.getDate() + i); return x; });
+  const mon = new Date(d); mon.setDate(d.getDate() - ((day+6)%7));
+  return Array.from({length:7}, (_,i) => { const x = new Date(mon); x.setDate(mon.getDate()+i); return x; });
 }
-const DAY_LABELS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+const DAY_LABELS = ["M","T","W","T","F","S","S"];
+
+function buildGCalEvent(locationId, date, startTime, endTime, allDay, note) {
+  const loc = LOC_MAP[locationId];
+  const title = `🐾 Barney — ${loc.label}`;
+  if (allDay) return { summary:title, description:note||"", start:{ date }, end:{ date } };
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return { summary:title, description:note||"", start:{ dateTime:`${date}T${startTime}:00`, timeZone:tz }, end:{ dateTime:`${date}T${endTime}:00`, timeZone:tz } };
+}
+
+// ── SHARED COMPONENTS ────────────────────────────────────────────────────────
+
+function Card({ children, style }) {
+  return <div style={{ background:"#fff", borderRadius:16, padding:16, marginBottom:12, boxShadow:"0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04)", ...style }}>{children}</div>;
+}
+
+function Btn({ children, onClick, variant="primary", style, disabled }) {
+  const variants = {
+    primary:   { background:"#1a1a2e", color:"#fff" },
+    secondary: { background:"#f1f5f9", color:"#334155" },
+    google:    { background:"#4285F4", color:"#fff" },
+  };
+  return (
+    <button onClick={onClick} disabled={disabled} style={{
+      border:"none", borderRadius:12, cursor:"pointer", fontSize:14, fontWeight:600,
+      padding:"12px 16px", width:"100%", fontFamily:"inherit",
+      opacity:disabled?0.5:1, transition:"opacity 0.15s",
+      ...variants[variant], ...style,
+    }}>{children}</button>
+  );
+}
+
+function Chip({ label, active, onClick, color }) {
+  return (
+    <button onClick={onClick} style={{
+      padding:"6px 14px", borderRadius:20, border:"none", cursor:"pointer",
+      fontSize:12, fontWeight:600, transition:"all 0.15s",
+      background:active?(color||"#1a1a2e"):"#f1f5f9",
+      color:active?"#fff":"#64748b",
+    }}>{label}</button>
+  );
+}
+
+function Input({ placeholder, value, onChange, type="text", style }) {
+  return (
+    <input type={type} placeholder={placeholder} value={value} onChange={onChange}
+      onFocus={e=>e.target.style.borderColor="#1a1a2e"}
+      onBlur={e=>e.target.style.borderColor="#e2e8f0"}
+      style={{ width:"100%", padding:"10px 14px", borderRadius:10, border:"1.5px solid #e2e8f0", fontSize:13, color:"#1e293b", background:"#f8fafc", marginBottom:10, boxSizing:"border-box", outline:"none", fontFamily:"inherit", transition:"border-color 0.15s", ...style }}
+    />
+  );
+}
+
+function LogItem({ icon, primary, secondary, time, by }) {
+  return (
+    <div style={{ display:"flex", alignItems:"center", gap:12, padding:"10px 0", borderBottom:"1px solid #f1f5f9" }}>
+      <div style={{ fontSize:22, width:36, textAlign:"center", flexShrink:0 }}>{icon}</div>
+      <div style={{ flex:1, minWidth:0 }}>
+        <div style={{ fontSize:13, fontWeight:600, color:"#1e293b" }}>{primary}</div>
+        {secondary && <div style={{ fontSize:11, color:"#94a3b8", marginTop:1 }}>{secondary}</div>}
+      </div>
+      <div style={{ textAlign:"right", flexShrink:0 }}>
+        <div style={{ fontSize:11, color:"#64748b", fontWeight:500 }}>{time}</div>
+        <div style={{ fontSize:10, color:"#94a3b8" }}>{by}</div>
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ icon, label, value, sub, subColor }) {
+  return (
+    <div style={{ background:"#fff", borderRadius:16, padding:"14px 16px", boxShadow:"0 1px 3px rgba(0,0,0,0.06)" }}>
+      <div style={{ fontSize:22, marginBottom:6 }}>{icon}</div>
+      <div style={{ fontSize:10, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.8 }}>{label}</div>
+      <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginTop:3 }}>{value}</div>
+      {sub && <div style={{ fontSize:10, color:subColor||"#94a3b8", marginTop:2, fontWeight:500 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function SectionTitle({ children }) {
+  return <div style={{ fontSize:11, fontWeight:700, color:"#94a3b8", textTransform:"uppercase", letterSpacing:1, margin:"18px 0 8px" }}>{children}</div>;
+}
+
+function Badge({ children, color }) {
+  return <span style={{ background:color+"18", color, fontSize:11, fontWeight:700, padding:"3px 10px", borderRadius:20 }}>{children}</span>;
+}
+
+// ── SIDEBAR ──────────────────────────────────────────────────────────────────
+
+function Sidebar({ open, onClose, tab, setTab, alerts }) {
+  return (
+    <>
+      {/* Backdrop */}
+      <div onClick={onClose} style={{
+        position:"fixed", inset:0, background:"rgba(0,0,0,0.4)",
+        zIndex:200, opacity:open?1:0, pointerEvents:open?"all":"none",
+        transition:"opacity 0.25s",
+      }} />
+
+      {/* Drawer */}
+      <div style={{
+        position:"fixed", top:0, left:0, bottom:0, width:260,
+        background:"#1a1a2e", zIndex:201, display:"flex", flexDirection:"column",
+        transform:open?"translateX(0)":"translateX(-100%)",
+        transition:"transform 0.28s cubic-bezier(0.4,0,0.2,1)",
+        boxShadow:"4px 0 24px rgba(0,0,0,0.3)",
+      }}>
+        {/* Sidebar header */}
+        <div style={{ padding:"24px 20px 16px", borderBottom:"1px solid rgba(255,255,255,0.08)" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:4 }}>
+            <div style={{ background:"rgba(255,255,255,0.1)", borderRadius:12, width:44, height:44, display:"flex", alignItems:"center", justifyContent:"center", fontSize:24 }}>🐕</div>
+            <div>
+              <div style={{ fontSize:20, fontWeight:700, color:"#fff" }}>Barney</div>
+              <div style={{ fontSize:11, color:"rgba(255,255,255,0.4)" }}>Tracker</div>
+            </div>
+          </div>
+        </div>
+
+        {/* Alerts in sidebar */}
+        {alerts.length > 0 && (
+          <div style={{ margin:"12px 12px 0", background:"rgba(239,68,68,0.15)", borderRadius:10, padding:"10px 12px" }}>
+            {alerts.map((a,i) => <div key={i} style={{ fontSize:11, color:"#fca5a5", fontWeight:600, marginBottom:i<alerts.length-1?4:0 }}>{a}</div>)}
+          </div>
+        )}
+
+        {/* Nav items */}
+        <div style={{ flex:1, overflowY:"auto", padding:"8px 0" }}>
+          {NAV.map(item => {
+            const active = tab === item.id;
+            return (
+              <button key={item.id} onClick={()=>{ setTab(item.id); onClose(); }} style={{
+                width:"100%", display:"flex", alignItems:"center", gap:14,
+                padding:"12px 20px", border:"none", cursor:"pointer",
+                background:active?"rgba(255,255,255,0.1)":"transparent",
+                borderLeft:active?"3px solid #fff":"3px solid transparent",
+                transition:"all 0.15s",
+              }}>
+                <span style={{ fontSize:18, width:24, textAlign:"center" }}>{item.icon}</span>
+                <span style={{ fontSize:14, fontWeight:active?700:500, color:active?"#fff":"rgba(255,255,255,0.55)" }}>{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding:"16px 20px", borderTop:"1px solid rgba(255,255,255,0.08)" }}>
+          <div style={{ fontSize:11, color:"rgba(255,255,255,0.25)", textAlign:"center" }}>Barney's Tracker 🐾</div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ── MAIN APP ─────────────────────────────────────────────────────────────────
 
 export default function BarneyApp() {
-  const [user, setUser] = useState(null);
-  const [tab, setTab] = useState("home");
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [tab, setTab]           = useState("home");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [loading, setLoading]   = useState(true);
+  const [saving, setSaving]     = useState(false);
 
-  // Data state
-  const [feeding, setFeeding] = useState([]);
-  const [toilet, setToilet] = useState([]);
-  const [food, setFood] = useState({ pouches: 0, alert_at: 5 });
-  const [treatments, setTreatments] = useState({ flea: null, worm: null });
-  const [calEvents, setCalEvents] = useState([]);
-  const [weight, setWeight] = useState([]);
-  const [walks, setWalks] = useState([]);
-  const [meds, setMeds] = useState([]);
-  const [behaviour, setBehaviour] = useState([]);
-  const [vetAppts, setVetAppts] = useState([]);
-  const [info, setInfo] = useState({});
-  const [photos, setPhotos] = useState([]);
-  const [grooming, setGrooming] = useState([]);
-  const [training, setTraining] = useState([]);
-  const [milestones, setMilestones] = useState([]);
-  const [expenses, setExpenses] = useState([]);
-  const [mood, setMood] = useState([]);
+  // Google auth
+  const [gToken, setGToken]               = useState(null);
+  const [gTokenClient, setGTokenClient]   = useState(null);
+  const [gAuthLoading, setGAuthLoading]   = useState(false);
+
+  // Data
+  const [feeding, setFeeding]       = useState([]);
+  const [toilet, setToilet]         = useState([]);
+  const [food, setFood]             = useState({ pouches:0, alert_at:5 });
+  const [treatments, setTreatments] = useState({ flea:null, worm:null });
+  const [weight, setWeight]         = useState([]);
+  const [walks, setWalks]           = useState([]);
+  const [meds, setMeds]             = useState([]);
+  const [behaviour, setBehaviour]   = useState([]);
+  const [vetAppts, setVetAppts]     = useState([]);
+  const [info, setInfo]             = useState({});
+  const [grooming, setGrooming]     = useState([]);
+  const [mood, setMood]             = useState([]);
+  const [gCalEvents, setGCalEvents] = useState([]);
+  const [calLoading, setCalLoading] = useState(false);
 
   // Calendar UI
-  const [weekAnchor, setWeekAnchor] = useState(new Date());
-  const [selectedDay, setSelectedDay] = useState(todayStr());
+  const [weekAnchor, setWeekAnchor]     = useState(new Date());
+  const [selectedDay, setSelectedDay]   = useState(todayStr());
   const [showAddEvent, setShowAddEvent] = useState(false);
-  const [newLoc, setNewLoc] = useState("home");
-  const [newStart, setNewStart] = useState("09:00");
-  const [newEnd, setNewEnd] = useState("17:00");
+  const [newLoc, setNewLoc]             = useState("home");
+  const [newStart, setNewStart]         = useState("09:00");
+  const [newEnd, setNewEnd]             = useState("17:00");
   const [newEventNote, setNewEventNote] = useState("");
-  const [allDay, setAllDay] = useState(false);
+  const [allDay, setAllDay]             = useState(false);
 
-  // Form state
-  const [feedNote, setFeedNote] = useState(""); const [feedAmount, setFeedAmount] = useState("Full portion");
-  const [walkDuration, setWalkDuration] = useState("30"); const [walkDistance, setWalkDistance] = useState(""); const [walkNote, setWalkNote] = useState("");
-  const [newWeight, setNewWeight] = useState("");
-  const [medName, setMedName] = useState(""); const [medDose, setMedDose] = useState(""); const [medNote, setMedNote] = useState("");
-  const [behavType, setBehavType] = useState(BEHAVIOUR_TYPES[0]); const [behavNote, setBehavNote] = useState("");
-  const [vetDate, setVetDate] = useState(""); const [vetReason, setVetReason] = useState(""); const [vetNotes, setVetNotes] = useState(""); const [vetIsUpcoming, setVetIsUpcoming] = useState(true);
+  // Forms
+  const [feedNote, setFeedNote]     = useState(""); const [feedAmount, setFeedAmount] = useState("Full portion"); const [feedEaten, setFeedEaten] = useState(100);
+  const [walkDur, setWalkDur]       = useState("30"); const [walkDist, setWalkDist] = useState(""); const [walkNote, setWalkNote] = useState("");
+  const [newWeight, setNewWeight]   = useState("");
+  const [medName, setMedName]       = useState(""); const [medDose, setMedDose] = useState(""); const [medNote, setMedNote] = useState("");
+  const [behavType, setBehavType]   = useState(BEHAVIOUR_TYPES[0]); const [behavNote, setBehavNote] = useState("");
+  const [vetDate, setVetDate]       = useState(""); const [vetReason, setVetReason] = useState(""); const [vetNotes, setVetNotes] = useState(""); const [vetUpcoming, setVetUpcoming] = useState(true);
   const [editingInfo, setEditingInfo] = useState(false); const [infoEdit, setInfoEdit] = useState({});
-  const [photoCaption, setPhotoCaption] = useState(""); const [photoData, setPhotoData] = useState(null);
-  const [groomType, setGroomType] = useState(GROOMING_TYPES[0]); const [groomNote, setGroomNote] = useState("");
-  const [trainCommands, setTrainCommands] = useState(""); const [trainRating, setTrainRating] = useState("Good"); const [trainNote, setTrainNote] = useState("");
-  const [milestoneTitle, setMilestoneTitle] = useState(""); const [milestoneNote, setMilestoneNote] = useState(""); const [milestoneDate, setMilestoneDate] = useState(todayStr());
-  const [expDate, setExpDate] = useState(todayStr()); const [expCat, setExpCat] = useState(EXPENSE_CATS[0]); const [expAmount, setExpAmount] = useState(""); const [expDesc, setExpDesc] = useState("");
-  const [selectedMood, setSelectedMood] = useState("happy"); const [moodNote, setMoodNote] = useState("");
+  const [groomType, setGroomType]   = useState(GROOMING_TYPES[0]); const [groomNote, setGroomNote] = useState(""); const [groomNextAppt, setGroomNextAppt] = useState(""); const [treatmentDates, setTreatmentDates] = useState({ fleaDate:"", wormDate:"" });
+  const [selMood, setSelMood]       = useState("happy"); const [moodNote, setMoodNote] = useState("");
 
+  // Load Google Identity Services
+  useEffect(() => {
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.onload = () => {
+      const client = window.google.accounts.oauth2.initTokenClient({
+        client_id: GOOGLE_CLIENT_ID, scope: GOOGLE_SCOPES,
+        callback: (resp) => { if (resp.access_token) { setGToken(resp.access_token); setGAuthLoading(false); } },
+      });
+      setGTokenClient(client);
+    };
+    document.head.appendChild(script);
+  }, []);
+
+  // Load app data
   useEffect(() => {
     async function load() {
       try {
-        const [f, t, fo, tr, cal, w, wk, m, b, v, inf, ph, gr, tr2, mi, ex, mo] = await Promise.all([
+        const [f,t,fo,tr,w,wk,m,b,v,inf,gr,mo] = await Promise.all([
           api.get("/api/feeding"), api.get("/api/toilet"), api.get("/api/food"),
-          api.get("/api/treatments"), api.get("/api/calendar"), api.get("/api/weight"),
-          api.get("/api/walks"), api.get("/api/medications"), api.get("/api/behaviour"),
-          api.get("/api/vet"), api.get("/api/info"), api.get("/api/photos"),
-          api.get("/api/grooming"), api.get("/api/training"), api.get("/api/milestones"),
-          api.get("/api/expenses"), api.get("/api/mood"),
+          api.get("/api/treatments"), api.get("/api/weight"), api.get("/api/walks"),
+          api.get("/api/medications"), api.get("/api/behaviour"), api.get("/api/vet"),
+          api.get("/api/info"), api.get("/api/grooming"), api.get("/api/mood"),
         ]);
-        setFeeding(f || []); setToilet(t || []); setFood(fo || { pouches: 0, alert_at: 5 });
-        setTreatments(tr || { flea: null, worm: null }); setCalEvents(cal || []); setWeight(w || []);
-        setWalks(wk || []); setMeds(m || []); setBehaviour(b || []); setVetAppts(v || []);
-        setInfo(inf || {}); setPhotos(ph || []); setGrooming(gr || []); setTraining(tr2 || []);
-        setMilestones(mi || []); setExpenses(ex || []); setMood(mo || []);
-      } catch (e) { console.error("Load error", e); }
+        setFeeding(Array.isArray(f)?f:[]); setToilet(Array.isArray(t)?t:[]);
+        setFood(fo||{pouches:0,alert_at:5}); setTreatments(tr||{flea:null,worm:null});
+        setWeight(Array.isArray(w)?w:[]); setWalks(Array.isArray(wk)?wk:[]);
+        setMeds(Array.isArray(m)?m:[]); setBehaviour(Array.isArray(b)?b:[]);
+        setVetAppts(Array.isArray(v)?v:[]); setInfo(inf||{});
+        setGrooming(Array.isArray(gr)?gr:[]); setMood(Array.isArray(mo)?mo:[]);
+      } catch(e) { console.error(e); }
       setLoading(false);
     }
     load();
   }, []);
 
+  // Load Google Calendar
+  const loadGCal = useCallback(async (token, anchor) => {
+    if (!token) return;
+    setCalLoading(true);
+    try {
+      const dates = getWeekDates(anchor);
+      // Load wider range (4 weeks back, 4 weeks forward) so "last known" works on home
+      const timeMin = new Date(dates[0].getTime() - 28*86400000).toISOString();
+      const timeMax = new Date(dates[6].getTime() + 28*86400000).toISOString();
+      const res = await gcal.get(
+        `/calendars/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/events?timeMin=${timeMin}&timeMax=${timeMax}&singleEvents=true&orderBy=startTime`,
+        token
+      );
+      setGCalEvents((res.items||[]).filter(e => e.summary?.startsWith("🐾 Barney")));
+    } catch(e) { console.error(e); }
+    setCalLoading(false);
+  }, []);
+
+  useEffect(() => { if (gToken) loadGCal(gToken, weekAnchor); }, [gToken, weekAnchor, loadGCal]);
+
   const s = async (fn) => { setSaving(true); try { await fn(); } finally { setSaving(false); } };
 
   // Actions
-  const logFeed = () => s(async () => {
-    await api.post("/api/feeding", { logged_by: user, amount: feedAmount, note: feedNote });
-    setFeeding(await api.get("/api/feeding")); setFeedNote("");
-  });
-  const logToilet = (type) => s(async () => {
-    await api.post("/api/toilet", { logged_by: user, type });
-    setToilet(await api.get("/api/toilet"));
-  });
-  const updateFood = (pouches, alert_at) => s(async () => {
-    const updated = { pouches: Math.max(0, pouches), alert_at: alert_at ?? food.alert_at, updated_by: user };
-    await api.put("/api/food", updated); setFood({ ...food, ...updated });
-  });
-  const logTreatment = (type) => s(async () => {
-    await api.post("/api/treatments", { type, logged_by: user });
-    setTreatments(await api.get("/api/treatments"));
-  });
-  const addEvent = () => s(async () => {
-    const id = uid();
-    await api.post("/api/calendar", { id, event_date: selectedDay, location_id: newLoc, start_time: allDay ? null : newStart, end_time: allDay ? null : newEnd, all_day: allDay, note: newEventNote, added_by: user });
-    const from = getWeekDates(weekAnchor)[0].toISOString().slice(0,10);
-    const to   = getWeekDates(weekAnchor)[6].toISOString().slice(0,10);
-    setCalEvents(await api.get(`/api/calendar?from=${from}&to=${to}`));
+  const logFeed       = () => s(async () => { const eatenNote = feedNote ? `${feedNote} · ate ${feedEaten}%` : `Ate ${feedEaten}%`; await api.post("/api/feeding", { logged_by:"App", amount:feedAmount, note:eatenNote }); setFeeding(await api.get("/api/feeding")); setFeedNote(""); setFeedEaten(100); });
+  const logToilet     = (type) => s(async () => { await api.post("/api/toilet", { logged_by:"App", type }); setToilet(await api.get("/api/toilet")); });
+  const updateFood    = (pouches, alert_at) => s(async () => { const u={pouches:Math.max(0,pouches),alert_at:alert_at??food.alert_at,updated_by:"App"}; await api.put("/api/food",u); setFood({...food,...u}); });
+  const logTreatment  = (type) => s(async () => { await api.post("/api/treatments", { type, logged_by:"App" }); setTreatments(await api.get("/api/treatments")); });
+  const logWalk       = () => s(async () => { const isDaycare = walkDur==="daycare"; await api.post("/api/walks", { logged_by:"App", duration_mins:isDaycare?0:parseInt(walkDur), distance:isDaycare?"daycare":walkDist, note:walkNote }); setWalks(await api.get("/api/walks")); setWalkNote(""); setWalkDist(""); });
+  const logWeight     = () => s(async () => { if (!newWeight) return; await api.post("/api/weight", { weight_kg:parseFloat(newWeight), logged_by:"App" }); setWeight(await api.get("/api/weight")); setNewWeight(""); });
+  const logMed        = () => s(async () => { if (!medName) return; await api.post("/api/medications", { logged_by:"App", name:medName, dose:medDose, note:medNote }); setMeds(await api.get("/api/medications")); setMedName(""); setMedDose(""); setMedNote(""); });
+  const logBehaviour  = () => s(async () => { await api.post("/api/behaviour", { logged_by:"App", type:behavType, note:behavNote }); setBehaviour(await api.get("/api/behaviour")); setBehavNote(""); });
+  const addVetAppt    = () => s(async () => { if (!vetDate||!vetReason) return; await api.post("/api/vet", { id:uid(), appt_date:vetDate, reason:vetReason, notes:vetNotes, upcoming:vetUpcoming, added_by:"App" }); setVetAppts(await api.get("/api/vet")); setVetDate(""); setVetReason(""); setVetNotes(""); });
+  const deleteVetAppt = (id) => s(async () => { await api.del(`/api/vet/${id}`); setVetAppts(p=>p.filter(a=>a.id!==id)); });
+  const saveInfo      = () => s(async () => { await api.put("/api/info", infoEdit); setInfo(infoEdit); setEditingInfo(false); });
+  const logGrooming   = () => s(async () => { await api.post("/api/grooming", { logged_by:"App", type:groomType, note:groomNote }); setGrooming(await api.get("/api/grooming")); setGroomNote(""); });
+  const logMood       = () => s(async () => { await api.post("/api/mood", { mood:selMood, logged_by:"App", note:moodNote }); setMood(await api.get("/api/mood")); setMoodNote(""); });
+
+  const addGCalEvent = () => s(async () => {
+    if (!gToken) { alert("Connect Google Calendar first"); return; }
+    await gcal.post(`/calendars/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/events`, gToken, buildGCalEvent(newLoc, selectedDay, newStart, newEnd, allDay, newEventNote));
+    await loadGCal(gToken, weekAnchor);
     setShowAddEvent(false); setNewEventNote(""); setAllDay(false);
   });
-  const deleteEvent = (id) => s(async () => {
-    await api.del(`/api/calendar/${id}`);
-    setCalEvents(prev => prev.filter(e => e.id !== id));
-  });
-  const logWalk = () => s(async () => {
-    await api.post("/api/walks", { logged_by: user, duration_mins: parseInt(walkDuration), distance: walkDistance, note: walkNote });
-    setWalks(await api.get("/api/walks")); setWalkNote(""); setWalkDistance("");
-  });
-  const logWeight = () => s(async () => {
-    if (!newWeight) return;
-    await api.post("/api/weight", { weight_kg: parseFloat(newWeight), logged_by: user });
-    setWeight(await api.get("/api/weight")); setNewWeight("");
-  });
-  const logMed = () => s(async () => {
-    if (!medName) return;
-    await api.post("/api/medications", { logged_by: user, name: medName, dose: medDose, note: medNote });
-    setMeds(await api.get("/api/medications")); setMedName(""); setMedDose(""); setMedNote("");
-  });
-  const logBehaviour = () => s(async () => {
-    await api.post("/api/behaviour", { logged_by: user, type: behavType, note: behavNote });
-    setBehaviour(await api.get("/api/behaviour")); setBehavNote("");
-  });
-  const addVetAppt = () => s(async () => {
-    if (!vetDate || !vetReason) return;
-    await api.post("/api/vet", { id: uid(), appt_date: vetDate, reason: vetReason, notes: vetNotes, upcoming: vetIsUpcoming, added_by: user });
-    setVetAppts(await api.get("/api/vet")); setVetDate(""); setVetReason(""); setVetNotes("");
-  });
-  const deleteVetAppt = (id) => s(async () => {
-    await api.del(`/api/vet/${id}`); setVetAppts(prev => prev.filter(a => a.id !== id));
-  });
-  const saveInfo = () => s(async () => {
-    await api.put("/api/info", infoEdit); setInfo(infoEdit); setEditingInfo(false);
-  });
-  const savePhoto = () => s(async () => {
-    if (!photoData) return;
-    await api.post("/api/photos", { id: uid(), photo_date: todayStr(), caption: photoCaption, data: photoData, added_by: user });
-    setPhotos(await api.get("/api/photos")); setPhotoData(null); setPhotoCaption("");
-  });
-  const deletePhoto = (id) => s(async () => {
-    await api.del(`/api/photos/${id}`); setPhotos(prev => prev.filter(p => p.id !== id));
-  });
-  const logGrooming = () => s(async () => {
-    await api.post("/api/grooming", { logged_by: user, type: groomType, note: groomNote });
-    setGrooming(await api.get("/api/grooming")); setGroomNote("");
-  });
-  const logTraining = () => s(async () => {
-    if (!trainCommands) return;
-    await api.post("/api/training", { logged_by: user, commands: trainCommands, rating: trainRating, note: trainNote });
-    setTraining(await api.get("/api/training")); setTrainCommands(""); setTrainNote("");
-  });
-  const addMilestone = () => s(async () => {
-    if (!milestoneTitle) return;
-    await api.post("/api/milestones", { id: uid(), milestone_date: milestoneDate, title: milestoneTitle, note: milestoneNote, added_by: user });
-    setMilestones(await api.get("/api/milestones")); setMilestoneTitle(""); setMilestoneNote("");
-  });
-  const deleteMilestone = (id) => s(async () => {
-    await api.del(`/api/milestones/${id}`); setMilestones(prev => prev.filter(m => m.id !== id));
-  });
-  const addExpense = () => s(async () => {
-    if (!expAmount) return;
-    await api.post("/api/expenses", { id: uid(), expense_date: expDate, category: expCat, amount: parseFloat(expAmount), description: expDesc, added_by: user });
-    setExpenses(await api.get("/api/expenses")); setExpAmount(""); setExpDesc("");
-  });
-  const deleteExpense = (id) => s(async () => {
-    await api.del(`/api/expenses/${id}`); setExpenses(prev => prev.filter(e => e.id !== id));
-  });
-  const logMood = () => s(async () => {
-    await api.post("/api/mood", { mood: selectedMood, logged_by: user, note: moodNote });
-    setMood(await api.get("/api/mood")); setMoodNote("");
+  const deleteGCalEvent = (id) => s(async () => {
+    if (!gToken) return;
+    await gcal.del(`/calendars/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/events/${id}`, gToken);
+    setGCalEvents(p=>p.filter(e=>e.id!==id));
   });
 
-  // Load calendar when week changes
-  useEffect(() => {
-    if (!user) return;
-    const from = getWeekDates(weekAnchor)[0].toISOString().slice(0,10);
-    const to   = getWeekDates(weekAnchor)[6].toISOString().slice(0,10);
-    api.get(`/api/calendar?from=${from}&to=${to}`).then(r => setCalEvents(r || []));
-  }, [weekAnchor, user]);
+  // ── COMPUTED ──
+  const today     = todayStr();
+  const nowTime   = new Date().toTimeString().slice(0,5);
+  const lastFeed  = feeding[0];
+  const lastWee   = toilet.find(t=>t.type==="wee");
+  const lastPoo   = toilet.find(t=>t.type==="poo");
+  const fleaDays  = daysSince(treatments.flea?.treated_at);
+  const wormDays  = daysSince(treatments.worm?.treated_at);
+  const weekDates = getWeekDates(weekAnchor);
+  const latestWeight  = weight.length>0 ? weight[weight.length-1] : null;
+  const todayWalks    = walks.filter(w=>w.created_at?.slice(0,10)===today);
+  const todayWalkMins = todayWalks.reduce((s,w)=>s+(w.duration_mins||0),0);
+  const upcomingVet   = vetAppts.filter(a=>a.upcoming&&a.appt_date>=today).sort((a,b)=>a.appt_date.localeCompare(b.appt_date));
+  const daysWithEvents = new Set(gCalEvents.map(e=>e.start?.date||e.start?.dateTime?.slice(0,10)));
+  const selectedDayEvents = gCalEvents.filter(e=>(e.start?.date||e.start?.dateTime?.slice(0,10))===selectedDay).sort((a,b)=>(a.start?.dateTime||"").localeCompare(b.start?.dateTime||""));
 
-  if (loading) return <div style={S.splash}><div style={{fontSize:64}}>🐕</div><div style={{color:"#8B6A55"}}>Loading Barney's tracker...</div></div>;
+  // Current location: active event NOW, else most recent past event
+  const nowMs = Date.now();
+  const currentEvent = gCalEvents.find(e => {
+    const d = e.start?.date||e.start?.dateTime?.slice(0,10);
+    if (d!==today) return false;
+    if (e.start?.date) return true;
+    return e.start?.dateTime?.slice(11,16)<=nowTime && nowTime<=e.end?.dateTime?.slice(11,16);
+  });
+  const lastKnownEvent = !currentEvent ? [...gCalEvents]
+    .filter(e => {
+      const start = e.start?.dateTime ? new Date(e.start.dateTime) : new Date(e.start?.date+"T00:00:00");
+      return start <= new Date();
+    })
+    .sort((a,b) => {
+      const aT = new Date(a.start?.dateTime||a.start?.date+"T00:00:00");
+      const bT = new Date(b.start?.dateTime||b.start?.date+"T00:00:00");
+      return bT - aT;
+    })[0] : null;
 
-  if (!user) return (
-    <div style={S.splash}>
-      <div style={{fontSize:72}}>🐾</div>
-      <h1 style={{fontSize:32,fontWeight:"bold",color:"#3D2B1F",margin:0}}>Barney's Tracker</h1>
-      <p style={{color:"#8B6A55",fontSize:17,margin:0}}>Who are you?</p>
-      <div style={{display:"flex",gap:16,flexWrap:"wrap",justifyContent:"center",marginTop:8}}>
-        {USERS.map(u => (
-          <button key={u} style={S.userBtn} onClick={() => setUser(u)}>
-            <span style={{fontSize:38}}>{u==="Jack"?"👩":u==="Jakey"?"👨":"👵"}</span>
-            <span>{u}</span>
-          </button>
-        ))}
-      </div>
+  const activeEvent = currentEvent || lastKnownEvent;
+  const activeLocLabel = activeEvent?.summary?.split("— ")[1];
+  const activeLoc = LOCATIONS.find(l=>l.label===activeLocLabel);
+  const isLiveLocation = !!currentEvent;
+
+  const alerts = [
+    food.pouches<=food.alert_at && "🥫 Food running low",
+    fleaDays>=28 && "🐛 Flea treatment due",
+    wormDays>=90 && "🪱 Worming due",
+    upcomingVet.length>0 && `🏥 Vet: ${upcomingVet[0].reason} — ${formatDate(upcomingVet[0].appt_date)}`,
+  ].filter(Boolean);
+
+  const currentTabLabel = NAV.find(n=>n.id===tab)?.label || "Home";
+
+  if (loading) return (
+    <div style={{ minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"#f8fafc", gap:12 }}>
+      <div style={{ fontSize:56 }}>🐾</div>
+      <div style={{ fontSize:15, color:"#94a3b8", fontWeight:500 }}>Loading Barney's tracker…</div>
     </div>
   );
 
-  // Computed
-  const today = todayStr();
-  const nowTime = new Date().toTimeString().slice(0,5);
-  const lastFeed = feeding[0];
-  const lastWee  = toilet.find(t => t.type === "wee");
-  const lastPoo  = toilet.find(t => t.type === "poo");
-  const fleaDays = daysSince(treatments.flea?.treated_at);
-  const wormDays = daysSince(treatments.worm?.treated_at);
-  const weekDates = getWeekDates(weekAnchor);
-  const todayCalEvents = calEvents.filter(e => e.event_date === selectedDay).sort((a,b)=>(a.start_time||"").localeCompare(b.start_time||""));
-  const currentEvents = calEvents.filter(e => e.event_date === today && (e.all_day || (e.start_time <= nowTime && nowTime <= (e.end_time||"23:59"))));
-  const currentLoc = currentEvents.length > 0 ? LOC_MAP[currentEvents[currentEvents.length-1].location_id] : null;
-  const upcomingVet = vetAppts.filter(a => a.upcoming && a.appt_date >= today).sort((a,b)=>a.appt_date.localeCompare(b.appt_date));
-  const latestWeight = weight.length > 0 ? weight[weight.length-1] : null;
-  const todayWalks = walks.filter(w => w.created_at?.slice(0,10) === today);
-  const todayWalkMins = todayWalks.reduce((s,w) => s + (w.duration_mins||0), 0);
-  const thisMonthExp = expenses.filter(e => e.expense_date?.slice(0,7) === today.slice(0,7)).reduce((s,e) => s + (e.amount||0), 0);
-  const showAlert = food.pouches <= food.alert_at || fleaDays >= 28 || wormDays >= 90 || upcomingVet.length > 0;
-
-  const tabs = [
-    { id:"home",      label:"Home",     icon:"🏠" },
-    { id:"calendar",  label:"Where",    icon:"📅" },
-    { id:"feed",      label:"Feeding",  icon:"🍽️" },
-    { id:"toilet",    label:"Toilet",   icon:"🌿" },
-    { id:"walks",     label:"Walks",    icon:"🦮" },
-    { id:"health",    label:"Health",   icon:"💊" },
-    { id:"vet",       label:"Vet",      icon:"🏥" },
-    { id:"grooming",  label:"Grooming", icon:"✂️" },
-    { id:"training",  label:"Training", icon:"🎓" },
-    { id:"milestones",label:"Moments",  icon:"⭐" },
-    { id:"expenses",  label:"Costs",    icon:"💰" },
-    { id:"info",      label:"Info",     icon:"📋" },
-    { id:"photos",    label:"Photos",   icon:"📸" },
-  ];
-
   return (
-    <div style={S.app}>
-      <div style={S.header}>
-        <div style={{display:"flex",alignItems:"center",gap:12}}>
-          <span style={{fontSize:32}}>🐕</span>
-          <div>
-            <div style={{fontSize:19,fontWeight:"bold"}}>Barney</div>
-            {currentLoc
-              ? <div style={{fontSize:11,opacity:0.85}}>{currentLoc.icon} {currentLoc.label} right now</div>
-              : <div style={{fontSize:11,opacity:0.7}}>Hi {user}! 👋</div>}
-          </div>
+    <div style={{ fontFamily:"-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", background:"#f8fafc", minHeight:"100vh", maxWidth:480, margin:"0 auto", display:"flex", flexDirection:"column" }}>
+
+      <Sidebar open={sidebarOpen} onClose={()=>setSidebarOpen(false)} tab={tab} setTab={setTab} alerts={alerts} />
+
+      {/* ── HEADER ── */}
+      <div style={{ background:"#1a1a2e", padding:"14px 18px", display:"flex", alignItems:"center", gap:14, flexShrink:0, position:"sticky", top:0, zIndex:100 }}>
+        <button onClick={()=>setSidebarOpen(true)} style={{ background:"none", border:"none", color:"rgba(255,255,255,0.8)", cursor:"pointer", fontSize:22, padding:0, lineHeight:1, flexShrink:0 }}>≡</button>
+        <div style={{ flex:1 }}>
+          <div style={{ fontSize:16, fontWeight:700, color:"#fff", letterSpacing:-0.2 }}>{currentTabLabel}</div>
+          {tab==="home" && activeLoc && (
+            <div style={{ fontSize:11, color:"rgba(255,255,255,0.45)", marginTop:1 }}>
+              {activeLoc.icon} {activeLoc.label} {isLiveLocation ? "· right now" : "· last known"}
+            </div>
+          )}
         </div>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>
-          {saving && <span style={{fontSize:11,opacity:0.7}}>Saving…</span>}
-          <button style={S.switchBtn} onClick={()=>setUser(null)}>Switch</button>
-        </div>
+        {saving && <div style={{ fontSize:11, color:"rgba(255,255,255,0.35)", fontWeight:500 }}>Saving…</div>}
+        {alerts.length>0 && (
+          <div style={{ background:"#ef4444", borderRadius:20, width:8, height:8, flexShrink:0 }} />
+        )}
       </div>
 
-      {showAlert && (
-        <div style={S.alertBar}>
-          {food.pouches <= food.alert_at && <span>🥫 Food low!</span>}
-          {fleaDays >= 28 && <span>🐛 Flea due!</span>}
-          {wormDays >= 90 && <span>🪱 Worming due!</span>}
-          {upcomingVet.length > 0 && <span>🏥 Vet: {upcomingVet[0].reason} – {formatDate(upcomingVet[0].appt_date)}</span>}
-        </div>
-      )}
+      {/* ── CONTENT ── */}
+      <div style={{ flex:1, padding:"14px 14px 32px", overflowY:"auto" }}>
 
-      <div style={S.tabBar}>
-        {tabs.map(t => (
-          <button key={t.id} style={{...S.tabBtn,...(tab===t.id?S.tabActive:{})}} onClick={()=>setTab(t.id)}>
-            <span>{t.icon}</span>
-            <span style={{fontSize:8,fontWeight:"bold",letterSpacing:0.3,textTransform:"uppercase"}}>{t.label}</span>
-          </button>
-        ))}
-      </div>
-
-      <div style={S.content}>
-
-        {/* HOME */}
+        {/* ── HOME ── */}
         {tab==="home" && (
           <div>
-            <div style={{...S.card,background:"#3D2B1F",color:"#FDF8F3"}}>
-              <div style={{fontSize:12,opacity:0.7,marginBottom:4}}>Barney is currently</div>
-              {currentLoc
-                ? <div style={{fontSize:20,fontWeight:"bold"}}>{currentLoc.icon} {currentLoc.label}</div>
-                : <div style={{fontSize:16,opacity:0.6}}>📍 No location set for now</div>}
-              <div style={{fontSize:11,opacity:0.5,marginTop:4}}>{new Date().toLocaleDateString([],{weekday:"long",day:"numeric",month:"long"})}</div>
-            </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
-              {[
-                {icon:"🍽️",label:"Last fed",      val:lastFeed?formatTime(lastFeed.created_at):"Not logged", sub:lastFeed?.amount},
-                {icon:"💧",label:"Last wee",       val:lastWee ?formatTime(lastWee.created_at) :"Not logged"},
-                {icon:"🥫",label:"Food stock",     val:`${food.pouches} pouches`, sub:food.pouches<=food.alert_at?"⚠️ Running low!":null, subColor:"#e74c3c"},
-                {icon:"🦮",label:"Walked today",   val:todayWalkMins>0?`${todayWalkMins} mins`:"Not yet"},
-              ].map((s,i)=>(
-                <div key={i} style={{...S.card,marginBottom:0,padding:"12px 14px"}}>
-                  <div style={{fontSize:20,marginBottom:3}}>{s.icon}</div>
-                  <div style={{fontSize:10,color:"#8B6A55",fontWeight:"bold",textTransform:"uppercase"}}>{s.label}</div>
-                  <div style={{fontSize:12,fontWeight:"bold",color:"#3D2B1F",marginTop:2}}>{s.val}</div>
-                  {s.sub&&<div style={{fontSize:10,color:s.subColor||"#8B6A55"}}>{s.sub}</div>}
-                </div>
-              ))}
-            </div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>Treatment countdown</h3>
-              {[{label:"Flea",days:fleaDays,cycle:28},{label:"Worming",days:wormDays,cycle:90}].map(({label,days,cycle})=>(
-                <div key={label} style={{marginBottom:10}}>
-                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
-                    <span style={{fontSize:12,color:"#3D2B1F",fontWeight:"bold"}}>{label}</span>
-                    <span style={{fontSize:12,fontWeight:"bold",color:days===null?"#ccc":days>=cycle?"#e74c3c":days>=cycle*0.75?"#f39c12":"#27ae60"}}>
-                      {days===null?"Not logged":days>=cycle?"Due now!":`${cycle-days} days left`}
-                    </span>
-                  </div>
-                  <div style={{height:5,background:"#EDE0D4",borderRadius:3,overflow:"hidden"}}>
-                    <div style={{height:"100%",borderRadius:3,width:`${days===null?0:Math.min(100,(days/cycle)*100)}%`,background:days>=cycle?"#e74c3c":days>=cycle*0.75?"#f39c12":"#27ae60"}} />
-                  </div>
-                </div>
-              ))}
-            </div>
-            {mood.length > 0 && (
-              <div style={{...S.card,marginBottom:12}}>
-                <h3 style={S.cardTitle}>Today's mood</h3>
-                <div style={{fontSize:28}}>{MOODS.find(m=>m.v===mood[0]?.mood)?.l || mood[0]?.mood}</div>
-                <div style={{fontSize:11,color:"#8B6A55"}}>logged by {mood[0]?.logged_by}</div>
+            {/* Location hero — driven by Google Calendar */}
+            <div style={{ borderRadius:20, padding:"22px 20px", marginBottom:14, position:"relative", overflow:"hidden", background: activeLoc ? `linear-gradient(135deg, ${activeLoc.color}dd, ${activeLoc.color}99)` : "linear-gradient(135deg, #1e293b, #334155)" }}>
+              <div style={{ position:"absolute", right:-8, top:-8, fontSize:90, opacity:0.12, lineHeight:1 }}>🐕</div>
+              <div style={{ fontSize:11, fontWeight:700, color:"rgba(255,255,255,0.7)", textTransform:"uppercase", letterSpacing:1, marginBottom:10 }}>
+                {isLiveLocation ? "Right now" : "Last known location"}
               </div>
-            )}
-            {latestWeight && (
-              <div style={{...S.card,marginBottom:12}}>
-                <h3 style={S.cardTitle}>Latest weight</h3>
-                <div style={{fontSize:28,fontWeight:"bold",color:"#3D2B1F"}}>{latestWeight.weight_kg} <span style={{fontSize:14,color:"#8B6A55"}}>kg</span></div>
-                <div style={{fontSize:11,color:"#8B6A55"}}>logged {formatDate(latestWeight.logged_date)} by {latestWeight.logged_by}</div>
-              </div>
-            )}
-            {thisMonthExp > 0 && (
-              <div style={{...S.card,marginBottom:0}}>
-                <h3 style={S.cardTitle}>This month's costs</h3>
-                <div style={{fontSize:28,fontWeight:"bold",color:"#3D2B1F"}}>£{thisMonthExp.toFixed(2)}</div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* CALENDAR */}
-        {tab==="calendar" && (
-          <div>
-            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
-              <button style={S.navBtn} onClick={()=>setWeekAnchor(d=>{const x=new Date(d);x.setDate(x.getDate()-7);return x;})}>‹</button>
-              <span style={{fontWeight:"bold",color:"#3D2B1F",fontSize:12}}>
-                {weekDates[0].toLocaleDateString([],{day:"numeric",month:"short"})} – {weekDates[6].toLocaleDateString([],{day:"numeric",month:"short",year:"numeric"})}
-              </span>
-              <button style={S.navBtn} onClick={()=>setWeekAnchor(d=>{const x=new Date(d);x.setDate(x.getDate()+7);return x;})}>›</button>
-            </div>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3,marginBottom:12}}>
-              {weekDates.map((d,i)=>{
-                const ds=d.toISOString().slice(0,10), isToday=ds===today, isSel=ds===selectedDay;
-                const evs=calEvents.filter(e=>e.event_date===ds);
-                const topLoc=evs.length>0?LOC_MAP[evs[evs.length-1].location_id]:null;
-                return (
-                  <button key={ds} style={{...S.dayCell,...(isSel?S.dayCellSel:{}),...(isToday&&!isSel?S.dayCellToday:{})}} onClick={()=>setSelectedDay(ds)}>
-                    <span style={{fontSize:9,color:isSel?"#fff":"#8B6A55",fontWeight:"bold"}}>{DAY_LABELS[i]}</span>
-                    <span style={{fontSize:13,fontWeight:"bold",color:isSel?"#fff":"#3D2B1F"}}>{d.getDate()}</span>
-                    <span style={{fontSize:11}}>{topLoc?topLoc.icon:"·"}</span>
-                  </button>
-                );
-              })}
-            </div>
-            <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:12}}>
-              {LOCATIONS.map(l=>(
-                <div key={l.id} style={{display:"flex",alignItems:"center",gap:3,background:l.color+"22",border:`1px solid ${l.color}66`,borderRadius:20,padding:"2px 7px",fontSize:10,color:l.color,fontWeight:"bold"}}>
-                  {l.icon} {l.label}
-                </div>
-              ))}
-            </div>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-              <h3 style={{margin:0,color:"#3D2B1F",fontSize:13,fontWeight:"bold"}}>
-                {new Date(selectedDay+"T12:00:00").toLocaleDateString([],{weekday:"long",day:"numeric",month:"long"})}
-              </h3>
-              <button style={S.addBtn} onClick={()=>setShowAddEvent(true)}>+ Add</button>
-            </div>
-            {todayCalEvents.length===0&&<div style={S.empty}>Nothing planned — tap + Add</div>}
-            {todayCalEvents.map(ev=>{
-              const loc=LOC_MAP[ev.location_id]||{icon:"📍",label:ev.location_id,color:"#ccc"};
-              return (
-                <div key={ev.id} style={{...S.eventCard,borderLeft:`4px solid ${loc.color}`}}>
-                  <div style={{display:"flex",alignItems:"center",gap:10,flex:1}}>
-                    <span style={{fontSize:20}}>{loc.icon}</span>
-                    <div>
-                      <div style={{fontWeight:"bold",color:"#3D2B1F",fontSize:12}}>{loc.label}</div>
-                      <div style={{fontSize:10,color:"#8B6A55"}}>{ev.all_day?"All day":`${ev.start_time} – ${ev.end_time}`} · {ev.added_by}</div>
-                      {ev.note&&<div style={{fontSize:10,color:"#6B4F3A",marginTop:1}}>📝 {ev.note}</div>}
-                    </div>
+              {activeLoc ? (
+                <>
+                  <div style={{ fontSize:32, fontWeight:800, color:"#fff", marginBottom:6, lineHeight:1.1 }}>
+                    {activeLoc.icon} {activeLoc.label}
                   </div>
-                  <button style={S.delBtn} onClick={()=>deleteEvent(ev.id)}>✕</button>
-                </div>
-              );
-            })}
-            {showAddEvent&&(
-              <div style={S.modalOverlay} onClick={()=>setShowAddEvent(false)}>
-                <div style={S.modal} onClick={e=>e.stopPropagation()}>
-                  <h3 style={{margin:"0 0 14px",color:"#3D2B1F",fontSize:15}}>Add event</h3>
-                  <div style={{fontSize:11,color:"#8B6A55",marginBottom:6,fontWeight:"bold"}}>Where is Barney?</div>
-                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:12}}>
-                    {LOCATIONS.map(l=>(
-                      <button key={l.id} style={{...S.locBtn,...(newLoc===l.id?{background:l.color,color:"#fff",borderColor:l.color}:{})}} onClick={()=>setNewLoc(l.id)}>
-                        <span style={{fontSize:16}}>{l.icon}</span><span style={{fontSize:10}}>{l.label}</span>
-                      </button>
-                    ))}
-                  </div>
-                  <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#3D2B1F",marginBottom:10,cursor:"pointer"}}>
-                    <input type="checkbox" checked={allDay} onChange={e=>setAllDay(e.target.checked)} /> All day
-                  </label>
-                  {!allDay&&(
-                    <div style={{display:"flex",gap:8,marginBottom:10}}>
-                      <div style={{flex:1}}><div style={{fontSize:10,color:"#8B6A55",marginBottom:3}}>From</div><input type="time" style={S.timeInput} value={newStart} onChange={e=>setNewStart(e.target.value)} /></div>
-                      <div style={{flex:1}}><div style={{fontSize:10,color:"#8B6A55",marginBottom:3}}>Until</div><input type="time" style={S.timeInput} value={newEnd} onChange={e=>setNewEnd(e.target.value)} /></div>
+                  {activeEvent && (
+                    <div style={{ fontSize:12, color:"rgba(255,255,255,0.7)", fontWeight:500 }}>
+                      {activeEvent.start?.date ? "All day" : `${activeEvent.start?.dateTime?.slice(11,16)} – ${activeEvent.end?.dateTime?.slice(11,16)}`}
+                      {activeEvent.description ? ` · ${activeEvent.description}` : ""}
                     </div>
                   )}
-                  <input style={S.input} placeholder="Notes (optional)" value={newEventNote} onChange={e=>setNewEventNote(e.target.value)} />
-                  <div style={{display:"flex",gap:8}}>
-                    <button style={{...S.primaryBtn,flex:1}} onClick={addEvent}>Save</button>
-                    <button style={{...S.primaryBtn,flex:1,background:"#EDE0D4",color:"#3D2B1F"}} onClick={()=>setShowAddEvent(false)}>Cancel</button>
+                  {!isLiveLocation && (
+                    <div style={{ fontSize:11, color:"rgba(255,255,255,0.5)", marginTop:4 }}>
+                      {activeEvent?.start?.date ? formatDate(activeEvent.start.date) : formatTime(activeEvent?.start?.dateTime)}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div style={{ fontSize:16, color:"rgba(255,255,255,0.6)", fontWeight:500 }}>
+                  {gToken ? "No calendar events found" : "Connect Google Calendar to see location →"}
+                </div>
+              )}
+            </div>
+
+            {/* Today's upcoming events */}
+            {gToken && gCalEvents.filter(e=>(e.start?.date||e.start?.dateTime?.slice(0,10))===today).length>0 && (
+              <Card style={{ marginBottom:14 }}>
+                <div style={{ fontSize:12, fontWeight:700, color:"#1e293b", marginBottom:10 }}>📅 Today's plan</div>
+                {gCalEvents
+                  .filter(e=>(e.start?.date||e.start?.dateTime?.slice(0,10))===today)
+                  .sort((a,b)=>(a.start?.dateTime||"").localeCompare(b.start?.dateTime||""))
+                  .map(ev=>{
+                    const locLabel = ev.summary?.split("— ")[1];
+                    const loc = LOCATIONS.find(l=>l.label===locLabel)||{ icon:"📅", color:"#94a3b8", label:locLabel };
+                    const startT = ev.start?.dateTime?.slice(11,16);
+                    const endT   = ev.end?.dateTime?.slice(11,16);
+                    const isPast = ev.end?.dateTime && ev.end.dateTime < new Date().toISOString();
+                    return (
+                      <div key={ev.id} style={{ display:"flex", alignItems:"center", gap:10, padding:"7px 0", borderBottom:"1px solid #f1f5f9", opacity:isPast?0.45:1 }}>
+                        <div style={{ width:4, height:32, borderRadius:2, background:loc.color, flexShrink:0 }} />
+                        <span style={{ fontSize:18 }}>{loc.icon}</span>
+                        <div style={{ flex:1 }}>
+                          <div style={{ fontSize:12, fontWeight:600, color:"#1e293b" }}>{loc.label}</div>
+                          <div style={{ fontSize:10, color:"#94a3b8" }}>{ev.start?.date?"All day":`${startT} – ${endT}`}</div>
+                        </div>
+                        {!isPast && <Badge color={loc.color}>upcoming</Badge>}
+                      </div>
+                    );
+                  })}
+              </Card>
+            )}
+
+            {/* Stats grid */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
+              <StatCard icon="🍽️" label="Last fed"    value={lastFeed?formatTime(lastFeed.created_at):"Not logged"} sub={lastFeed?.amount} />
+              <StatCard icon="💧" label="Last wee"    value={lastWee?formatTime(lastWee.created_at):"Not logged"} />
+              <StatCard icon="🥫" label="Food stock"  value={`${food.pouches} pouches`} sub={food.pouches<=food.alert_at?"⚠️ Running low":null} subColor="#ef4444" />
+              <StatCard icon="🦮" label="Walked today" value={todayWalkMins>0?`${todayWalkMins} mins`:"Not yet"} />
+            </div>
+
+            {/* Treatment countdown */}
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>Treatment countdown</div>
+              {[{label:"Flea",days:fleaDays,cycle:28},{label:"Worming",days:wormDays,cycle:90}].map(({label,days,cycle})=>(
+                <div key={label} style={{ marginBottom:12 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+                    <span style={{ fontSize:13, fontWeight:600, color:"#334155" }}>{label} treatment</span>
+                    <Badge color={days===null?"#94a3b8":days>=cycle?"#ef4444":days>=cycle*0.75?"#f59e0b":"#10b981"}>
+                      {days===null?"Not logged":days>=cycle?"Due now!":`${cycle-days}d left`}
+                    </Badge>
+                  </div>
+                  <div style={{ height:6, background:"#f1f5f9", borderRadius:3, overflow:"hidden" }}>
+                    <div style={{ height:"100%", borderRadius:3, width:`${days===null?0:Math.min(100,(days/cycle)*100)}%`, background:days>=cycle?"#ef4444":days>=cycle*0.75?"#f59e0b":"#10b981", transition:"width 0.5s" }} />
                   </div>
                 </div>
+              ))}
+            </Card>
+
+            {/* Weight + mood */}
+            {(latestWeight || mood.length>0) && (
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+                {latestWeight && (
+                  <Card style={{ marginBottom:0 }}>
+                    <div style={{ fontSize:11, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.8, marginBottom:6 }}>Weight</div>
+                    <div style={{ fontSize:24, fontWeight:700, color:"#1e293b" }}>{latestWeight.weight_kg}<span style={{ fontSize:13, color:"#94a3b8", fontWeight:500 }}>kg</span></div>
+                    <div style={{ fontSize:10, color:"#94a3b8", marginTop:2 }}>{formatDate(latestWeight.logged_date)}</div>
+                  </Card>
+                )}
+                {mood.length>0 && (
+                  <Card style={{ marginBottom:0 }}>
+                    <div style={{ fontSize:11, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.8, marginBottom:6 }}>Mood</div>
+                    <div style={{ fontSize:28 }}>{MOODS.find(m=>m.v===mood[0]?.mood)?.e||"😐"}</div>
+                    <div style={{ fontSize:12, fontWeight:600, color:"#1e293b", marginTop:2 }}>{MOODS.find(m=>m.v===mood[0]?.mood)?.l||mood[0]?.mood}</div>
+                  </Card>
+                )}
               </div>
             )}
           </div>
         )}
 
-        {/* FEEDING */}
+        {/* ── CALENDAR ── */}
+        {tab==="calendar" && (
+          <div>
+            {!gToken ? (
+              <Card style={{ textAlign:"center", padding:"32px 20px" }}>
+                <div style={{ fontSize:48, marginBottom:12 }}>📅</div>
+                <div style={{ fontSize:16, fontWeight:700, color:"#1e293b", marginBottom:8 }}>Connect Google Calendar</div>
+                <div style={{ fontSize:13, color:"#94a3b8", marginBottom:20, lineHeight:1.5 }}>Sign in with the shared Barney Google account to view and add calendar events.</div>
+                <Btn variant="google" onClick={()=>{ setGAuthLoading(true); gTokenClient?.requestAccessToken(); }} disabled={gAuthLoading}>
+                  {gAuthLoading?"Connecting…":"🔗 Connect Google Calendar"}
+                </Btn>
+              </Card>
+            ) : (
+              <>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+                  <span style={{ fontSize:12, color:"#10b981", fontWeight:600 }}>✅ Calendar connected</span>
+                  <button onClick={()=>setGToken(null)} style={{ background:"none", border:"none", fontSize:12, color:"#94a3b8", cursor:"pointer", fontWeight:500 }}>Disconnect</button>
+                </div>
+
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12 }}>
+                  <button onClick={()=>setWeekAnchor(d=>{const x=new Date(d);x.setDate(x.getDate()-7);return x;})} style={{ background:"#f1f5f9", border:"none", borderRadius:8, padding:"6px 12px", cursor:"pointer", fontSize:16, color:"#334155", fontWeight:700 }}>‹</button>
+                  <span style={{ fontSize:13, fontWeight:700, color:"#1e293b" }}>
+                    {weekDates[0].toLocaleDateString([],{day:"numeric",month:"short"})} – {weekDates[6].toLocaleDateString([],{day:"numeric",month:"short",year:"numeric"})}
+                  </span>
+                  <button onClick={()=>setWeekAnchor(d=>{const x=new Date(d);x.setDate(x.getDate()+7);return x;})} style={{ background:"#f1f5f9", border:"none", borderRadius:8, padding:"6px 12px", cursor:"pointer", fontSize:16, color:"#334155", fontWeight:700 }}>›</button>
+                </div>
+
+                <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", gap:4, marginBottom:14 }}>
+                  {weekDates.map((d,i)=>{
+                    const ds=d.toISOString().slice(0,10), isToday=ds===today, isSel=ds===selectedDay;
+                    return (
+                      <button key={ds} onClick={()=>setSelectedDay(ds)} style={{
+                        display:"flex", flexDirection:"column", alignItems:"center", gap:2, padding:"8px 2px",
+                        borderRadius:12, border:"none", cursor:"pointer", transition:"all 0.15s",
+                        background:isSel?"#1a1a2e":isToday?"#f0f9ff":"#fff",
+                        boxShadow:isSel?"0 2px 8px rgba(26,26,46,0.25)":"0 1px 3px rgba(0,0,0,0.06)",
+                        outline:isToday&&!isSel?"2px solid #3b82f6":"none", outlineOffset:"-2px",
+                      }}>
+                        <span style={{ fontSize:9, color:isSel?"rgba(255,255,255,0.55)":"#94a3b8", fontWeight:700 }}>{DAY_LABELS[i]}</span>
+                        <span style={{ fontSize:14, fontWeight:700, color:isSel?"#fff":"#1e293b" }}>{d.getDate()}</span>
+                        <span style={{ fontSize:11, opacity:daysWithEvents.has(ds)?1:0.15 }}>🐾</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div style={{ display:"flex", flexWrap:"wrap", gap:5, marginBottom:14 }}>
+                  {LOCATIONS.map(l=>(
+                    <div key={l.id} style={{ display:"flex", alignItems:"center", gap:4, background:l.color+"15", borderRadius:20, padding:"3px 10px", fontSize:11, color:l.color, fontWeight:600 }}>
+                      {l.icon} {l.label}
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+                  <div style={{ fontSize:14, fontWeight:700, color:"#1e293b" }}>
+                    {new Date(selectedDay+"T12:00:00").toLocaleDateString([],{weekday:"long",day:"numeric",month:"long"})}
+                  </div>
+                  <Btn onClick={()=>setShowAddEvent(true)} style={{ width:"auto", padding:"7px 14px", borderRadius:20, fontSize:12 }}>+ Add</Btn>
+                </div>
+
+                {calLoading && <div style={{ textAlign:"center", padding:20, color:"#94a3b8", fontSize:13 }}>Loading…</div>}
+                {!calLoading && selectedDayEvents.length===0 && <div style={{ textAlign:"center", padding:24, color:"#94a3b8", fontSize:13 }}>Nothing planned — tap + Add</div>}
+
+                {selectedDayEvents.map(ev=>{
+                  const locLabel=ev.summary?.split("— ")[1];
+                  const loc=LOCATIONS.find(l=>l.label===locLabel)||{ icon:"📅", color:"#94a3b8", label:locLabel||ev.summary };
+                  const startT=ev.start?.dateTime?.slice(11,16), endT=ev.end?.dateTime?.slice(11,16);
+                  return (
+                    <div key={ev.id} style={{ background:"#fff", borderRadius:14, padding:"12px 14px", marginBottom:8, display:"flex", alignItems:"center", gap:12, boxShadow:"0 1px 3px rgba(0,0,0,0.06)", borderLeft:`4px solid ${loc.color}` }}>
+                      <span style={{ fontSize:22 }}>{loc.icon}</span>
+                      <div style={{ flex:1 }}>
+                        <div style={{ fontSize:13, fontWeight:600, color:"#1e293b" }}>{loc.label}</div>
+                        <div style={{ fontSize:11, color:"#94a3b8", marginTop:1 }}>{ev.start?.date?"All day":`${startT} – ${endT}`}</div>
+                        {ev.description&&<div style={{ fontSize:11, color:"#64748b", marginTop:2 }}>📝 {ev.description}</div>}
+                      </div>
+                      <button onClick={()=>deleteGCalEvent(ev.id)} style={{ background:"#fef2f2", border:"none", borderRadius:8, padding:"5px 9px", cursor:"pointer", color:"#ef4444", fontSize:12, fontWeight:700 }}>✕</button>
+                    </div>
+                  );
+                })}
+
+                {showAddEvent && (
+                  <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.4)", display:"flex", alignItems:"flex-end", justifyContent:"center", zIndex:300 }} onClick={()=>setShowAddEvent(false)}>
+                    <div style={{ background:"#f8fafc", borderRadius:"20px 20px 0 0", padding:22, width:"100%", maxWidth:480, maxHeight:"88vh", overflowY:"auto" }} onClick={e=>e.stopPropagation()}>
+                      <div style={{ width:36, height:4, background:"#e2e8f0", borderRadius:2, margin:"0 auto 16px" }} />
+                      <div style={{ fontSize:16, fontWeight:700, color:"#1e293b", marginBottom:14 }}>Add to calendar</div>
+                      <div style={{ fontSize:11, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.8, marginBottom:8 }}>Where is Barney?</div>
+                      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:14 }}>
+                        {LOCATIONS.map(l=>(
+                          <button key={l.id} onClick={()=>setNewLoc(l.id)} style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:5, padding:"12px 8px", borderRadius:12, border:`2px solid ${newLoc===l.id?l.color:"#e2e8f0"}`, background:newLoc===l.id?l.color+"15":"#fff", cursor:"pointer", color:newLoc===l.id?l.color:"#64748b", fontWeight:600, fontSize:11 }}>
+                            <span style={{ fontSize:20 }}>{l.icon}</span>{l.label}
+                          </button>
+                        ))}
+                      </div>
+                      <label style={{ display:"flex", alignItems:"center", gap:8, fontSize:13, color:"#334155", marginBottom:12, cursor:"pointer", fontWeight:500 }}>
+                        <input type="checkbox" checked={allDay} onChange={e=>setAllDay(e.target.checked)} /> All day
+                      </label>
+                      {!allDay && (
+                        <div style={{ display:"flex", gap:10, marginBottom:10 }}>
+                          <div style={{ flex:1 }}><div style={{ fontSize:11, color:"#94a3b8", marginBottom:4 }}>From</div><input type="time" value={newStart} onChange={e=>setNewStart(e.target.value)} style={{ width:"100%", padding:"9px 12px", borderRadius:9, border:"1.5px solid #e2e8f0", fontSize:13, background:"#f8fafc", outline:"none", boxSizing:"border-box" }} /></div>
+                          <div style={{ flex:1 }}><div style={{ fontSize:11, color:"#94a3b8", marginBottom:4 }}>Until</div><input type="time" value={newEnd} onChange={e=>setNewEnd(e.target.value)} style={{ width:"100%", padding:"9px 12px", borderRadius:9, border:"1.5px solid #e2e8f0", fontSize:13, background:"#f8fafc", outline:"none", boxSizing:"border-box" }} /></div>
+                        </div>
+                      )}
+                      <Input placeholder="Notes (optional)" value={newEventNote} onChange={e=>setNewEventNote(e.target.value)} />
+                      <div style={{ display:"flex", gap:8, marginTop:4 }}>
+                        <Btn onClick={addGCalEvent} style={{ flex:1 }}>Save to Google Calendar</Btn>
+                        <Btn variant="secondary" onClick={()=>setShowAddEvent(false)} style={{ flex:1 }}>Cancel</Btn>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ── FEEDING ── */}
         {tab==="feed" && (
           <div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>Log a meal</h3>
-              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
-                {["Full portion","Half portion","Treat only"].map(a=>(
-                  <button key={a} style={{...S.chipBtn,...(feedAmount===a?S.chipActive:{})}} onClick={()=>setFeedAmount(a)}>{a}</button>
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>Log a meal</div>
+              <div style={{ fontSize:11, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.8, marginBottom:6 }}>Portion size</div>
+              <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:14 }}>
+                {["Full portion","Half portion","Treat only"].map(a=><Chip key={a} label={a} active={feedAmount===a} onClick={()=>setFeedAmount(a)} />)}
+              </div>
+              <div style={{ fontSize:11, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.8, marginBottom:8 }}>How much did he eat?</div>
+              <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:6 }}>
+                <div style={{ flex:1, height:6, background:"#f1f5f9", borderRadius:3, overflow:"hidden" }}>
+                  <div style={{ height:"100%", borderRadius:3, width:`${feedEaten}%`, background:feedEaten>=75?"#10b981":feedEaten>=40?"#f59e0b":"#ef4444", transition:"width 0.2s" }} />
+                </div>
+                <div style={{ fontSize:20, fontWeight:800, color:"#1e293b", minWidth:48, textAlign:"right" }}>{feedEaten}%</div>
+              </div>
+              <div style={{ display:"flex", gap:6, marginBottom:14 }}>
+                {[0,25,50,75,100].map(p=>(
+                  <button key={p} onClick={()=>setFeedEaten(p)} style={{ flex:1, padding:"7px 4px", borderRadius:9, border:`2px solid ${feedEaten===p?"#1a1a2e":"#e2e8f0"}`, background:feedEaten===p?"#1a1a2e":"#fff", color:feedEaten===p?"#fff":"#64748b", cursor:"pointer", fontSize:12, fontWeight:700 }}>{p}%</button>
                 ))}
               </div>
-              <input style={S.input} placeholder="Notes? (e.g. ate slowly)" value={feedNote} onChange={e=>setFeedNote(e.target.value)} />
-              <button style={S.primaryBtn} onClick={logFeed}>🍽️ Log meal</button>
-            </div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>Food cupboard</h3>
-              <div style={{textAlign:"center",padding:"8px 0 14px"}}>
-                <div style={{fontSize:52,fontWeight:"bold",color:food.pouches<=food.alert_at?"#e74c3c":food.pouches<=food.alert_at*2?"#f39c12":"#27ae60"}}>{food.pouches}</div>
-                <div style={{color:"#8B6A55",fontSize:13}}>pouches remaining</div>
-                {food.pouches<=food.alert_at&&<div style={{color:"#e74c3c",fontWeight:"bold",marginTop:5,fontSize:12}}>⚠️ Running low!</div>}
+              <Input placeholder="Notes? (e.g. ate slowly, left the meat)" value={feedNote} onChange={e=>setFeedNote(e.target.value)} />
+              <Btn onClick={logFeed}>🍽️ Log meal</Btn>
+            </Card>
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>Food cupboard</div>
+              <div style={{ textAlign:"center", padding:"8px 0 16px" }}>
+                <div style={{ fontSize:56, fontWeight:800, lineHeight:1, color:food.pouches<=food.alert_at?"#ef4444":food.pouches<=food.alert_at*2?"#f59e0b":"#10b981" }}>{food.pouches}</div>
+                <div style={{ color:"#94a3b8", fontSize:13, fontWeight:500, marginTop:4 }}>pouches remaining</div>
+                {food.pouches<=food.alert_at&&<div style={{ color:"#ef4444", fontSize:12, fontWeight:600, marginTop:6 }}>⚠️ Running low — time to restock!</div>}
               </div>
-              <div style={{display:"flex",gap:6,marginBottom:10}}>
-                {[[-1,"−1"],[-3,"−3"]].map(([d,l])=><button key={l} style={S.countBtn} onClick={()=>updateFood(food.pouches+d)}>{l}</button>)}
-                {[[12,"+12"],[24,"+24"]].map(([d,l])=><button key={l} style={{...S.countBtn,background:"#27ae60",color:"#fff"}} onClick={()=>updateFood(food.pouches+d)}>{l}</button>)}
+              <div style={{ display:"flex", gap:6, marginBottom:12 }}>
+                {[[-1,"−1"],[-3,"−3"]].map(([d,l])=><button key={l} onClick={()=>updateFood(food.pouches+d)} style={{ flex:1, padding:10, background:"#fef2f2", border:"none", borderRadius:10, cursor:"pointer", fontSize:14, fontWeight:700, color:"#ef4444" }}>{l}</button>)}
+                {[[12,"+12"],[24,"+24"]].map(([d,l])=><button key={l} onClick={()=>updateFood(food.pouches+d)} style={{ flex:1, padding:10, background:"#f0fdf4", border:"none", borderRadius:10, cursor:"pointer", fontSize:14, fontWeight:700, color:"#10b981" }}>{l}</button>)}
               </div>
-              <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                <span style={{color:"#888",fontSize:11}}>Set exact:</span>
-                <input type="number" style={{...S.input,width:60,marginBottom:0,padding:"7px 8px"}} value={food.pouches} onChange={e=>updateFood(parseInt(e.target.value)||0)} />
-                <span style={{color:"#888",fontSize:11}}>Alert below:</span>
-                <input type="number" style={{...S.input,width:50,marginBottom:0,padding:"7px 8px"}} value={food.alert_at} onChange={e=>updateFood(food.pouches, parseInt(e.target.value)||0)} />
+              <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+                <span style={{ fontSize:11, color:"#94a3b8", whiteSpace:"nowrap" }}>Set exact:</span>
+                <input type="number" value={food.pouches} onChange={e=>updateFood(parseInt(e.target.value)||0)} style={{ width:60, padding:"7px 10px", borderRadius:8, border:"1.5px solid #e2e8f0", fontSize:13, background:"#f8fafc", outline:"none", textAlign:"center" }} />
+                <span style={{ fontSize:11, color:"#94a3b8", whiteSpace:"nowrap" }}>Alert at:</span>
+                <input type="number" value={food.alert_at} onChange={e=>updateFood(food.pouches,parseInt(e.target.value)||0)} style={{ width:50, padding:"7px 10px", borderRadius:8, border:"1.5px solid #e2e8f0", fontSize:13, background:"#f8fafc", outline:"none", textAlign:"center" }} />
               </div>
-            </div>
-            <h3 style={S.sectionTitle}>Recent meals</h3>
-            {feeding.length===0&&<div style={S.empty}>No meals logged yet</div>}
-            {feeding.slice(0,15).map((f,i)=>(
-              <div key={i} style={S.logItem}>
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <span style={{fontSize:18}}>🍽️</span>
-                  <div><div style={S.logPrimary}>{f.amount}</div>{f.note&&<div style={S.logNote}>{f.note}</div>}</div>
-                </div>
-                <div style={{textAlign:"right"}}><div style={S.logTime}>{formatTime(f.created_at)}</div><div style={S.logUser}>by {f.logged_by}</div></div>
-              </div>
-            ))}
+            </Card>
+            <SectionTitle>Recent meals</SectionTitle>
+            <Card>{feeding.length===0&&<div style={{ textAlign:"center", padding:"16px 0", color:"#94a3b8", fontSize:13 }}>No meals logged yet</div>}{feeding.slice(0,15).map((f,i)=><LogItem key={i} icon="🍽️" primary={f.amount} secondary={f.note} time={formatTime(f.created_at)} by={`by ${f.logged_by}`} />)}</Card>
           </div>
         )}
 
-        {/* TOILET */}
+        {/* ── TOILET ── */}
         {tab==="toilet" && (
           <div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>Log toilet trip</h3>
-              <div style={{display:"flex",gap:10,marginBottom:10}}>
-                <button style={{...S.bigBtn,background:"#3D7EA6"}} onClick={()=>logToilet("wee")}><span style={{fontSize:28}}>💧</span>Wee</button>
-                <button style={{...S.bigBtn,background:"#6B4F3A"}} onClick={()=>logToilet("poo")}><span style={{fontSize:28}}>💩</span>Poo</button>
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>Log toilet trip</div>
+              <div style={{ display:"flex", gap:10, marginBottom:14 }}>
+                <button onClick={()=>logToilet("wee")} style={{ flex:1, padding:"18px 10px", background:"linear-gradient(135deg,#3b82f6,#2563eb)", color:"#fff", border:"none", borderRadius:14, cursor:"pointer", fontSize:15, fontWeight:700, display:"flex", flexDirection:"column", alignItems:"center", gap:6 }}><span style={{ fontSize:28 }}>💧</span>Wee</button>
+                <button onClick={()=>logToilet("poo")} style={{ flex:1, padding:"18px 10px", background:"linear-gradient(135deg,#92400e,#78350f)", color:"#fff", border:"none", borderRadius:14, cursor:"pointer", fontSize:15, fontWeight:700, display:"flex", flexDirection:"column", alignItems:"center", gap:6 }}><span style={{ fontSize:28 }}>💩</span>Poo</button>
               </div>
-              <div style={{display:"flex",gap:10}}>
-                <div style={{flex:1,background:"#F0F7FF",borderRadius:10,padding:"10px 12px",fontSize:12}}>
-                  <div style={{color:"#8B6A55"}}>Last wee</div>
-                  <div style={{fontWeight:"bold",color:"#3D2B1F",marginTop:2}}>{lastWee?formatTime(lastWee.created_at):"Not logged"}</div>
-                </div>
-                <div style={{flex:1,background:"#FDF5F0",borderRadius:10,padding:"10px 12px",fontSize:12}}>
-                  <div style={{color:"#8B6A55"}}>Last poo</div>
-                  <div style={{fontWeight:"bold",color:"#3D2B1F",marginTop:2}}>{lastPoo?formatTime(lastPoo.created_at):"Not logged"}</div>
-                </div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+                {[{l:"Last wee",v:lastWee},{l:"Last poo",v:lastPoo}].map(({l,v})=>(
+                  <div key={l} style={{ background:"#f8fafc", borderRadius:10, padding:"10px 12px" }}>
+                    <div style={{ fontSize:10, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.5 }}>{l}</div>
+                    <div style={{ fontSize:12, fontWeight:700, color:"#1e293b", marginTop:3 }}>{v?formatTime(v.created_at):"Not logged"}</div>
+                  </div>
+                ))}
               </div>
-            </div>
-            <h3 style={S.sectionTitle}>Recent trips</h3>
-            {toilet.length===0&&<div style={S.empty}>No trips logged yet</div>}
-            {toilet.slice(0,20).map((t,i)=>(
-              <div key={i} style={S.logItem}>
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <span style={{fontSize:18}}>{t.type==="wee"?"💧":"💩"}</span>
-                  <div style={S.logPrimary}>{t.type==="wee"?"Wee":"Poo"}</div>
-                </div>
-                <div style={{textAlign:"right"}}><div style={S.logTime}>{formatTime(t.created_at)}</div><div style={S.logUser}>by {t.logged_by}</div></div>
-              </div>
-            ))}
+            </Card>
+            <SectionTitle>Recent trips</SectionTitle>
+            <Card>{toilet.length===0&&<div style={{ textAlign:"center", padding:"16px 0", color:"#94a3b8", fontSize:13 }}>No trips logged yet</div>}{toilet.slice(0,20).map((t,i)=><LogItem key={i} icon={t.type==="wee"?"💧":"💩"} primary={t.type==="wee"?"Wee":"Poo"} time={formatTime(t.created_at)} by={`by ${t.logged_by}`} />)}</Card>
           </div>
         )}
 
-        {/* WALKS */}
+        {/* ── WALKS ── */}
         {tab==="walks" && (
           <div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>Log a walk</h3>
-              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>Log activity</div>
+              <div style={{ fontSize:11, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.8, marginBottom:6 }}>Duration</div>
+              <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:14 }}>
                 {["15","20","30","45","60","90"].map(m=>(
-                  <button key={m} style={{...S.chipBtn,...(walkDuration===m?S.chipActive:{})}} onClick={()=>setWalkDuration(m)}>{m} min</button>
+                  <Chip key={m} label={`${m} min`} active={walkDur===m && walkDur!=="daycare"} onClick={()=>setWalkDur(m)} />
                 ))}
+                <Chip label="🐾 Daycare day" active={walkDur==="daycare"} onClick={()=>setWalkDur("daycare")} color="#8b5cf6" />
               </div>
-              <input style={S.input} placeholder="Distance (e.g. 2km) — optional" value={walkDistance} onChange={e=>setWalkDistance(e.target.value)} />
-              <input style={S.input} placeholder="Notes (e.g. off lead in park)" value={walkNote} onChange={e=>setWalkNote(e.target.value)} />
-              <button style={S.primaryBtn} onClick={logWalk}>🦮 Log walk</button>
-            </div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>Today</h3>
+              {walkDur!=="daycare" && (
+                <Input placeholder="Distance (e.g. 2km) — optional" value={walkDist} onChange={e=>setWalkDist(e.target.value)} />
+              )}
+              <Input placeholder={walkDur==="daycare" ? "Notes (e.g. had a great time!)" : "Notes (e.g. off lead in park)"} value={walkNote} onChange={e=>setWalkNote(e.target.value)} />
+              <Btn onClick={logWalk}>{walkDur==="daycare" ? "🐾 Log daycare day" : "🦮 Log walk"}</Btn>
+            </Card>
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:8 }}>Today</div>
               {todayWalks.length===0
-                ? <div style={{color:"#8B6A55",fontSize:13}}>No walks yet today</div>
-                : <><div style={{fontSize:26,fontWeight:"bold",color:"#3D2B1F"}}>{todayWalkMins} <span style={{fontSize:13,color:"#8B6A55"}}>mins</span></div>
-                  {todayWalks.map((w,i)=><div key={i} style={{fontSize:12,color:"#6B4F3A",marginTop:3}}>· {w.duration_mins} min{w.distance?` · ${w.distance}`:""} by {w.logged_by}{w.note?` — ${w.note}`:""}</div>)}
-                </>}
-            </div>
-            <h3 style={S.sectionTitle}>Recent walks</h3>
-            {walks.slice(0,15).map((w,i)=>(
-              <div key={i} style={S.logItem}>
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <span style={{fontSize:18}}>🦮</span>
-                  <div><div style={S.logPrimary}>{w.duration_mins} min{w.distance?` · ${w.distance}`:""}</div>{w.note&&<div style={S.logNote}>{w.note}</div>}</div>
-                </div>
-                <div style={{textAlign:"right"}}><div style={S.logTime}>{formatTime(w.created_at)}</div><div style={S.logUser}>by {w.logged_by}</div></div>
-              </div>
-            ))}
+                ? <div style={{ color:"#94a3b8", fontSize:13 }}>Nothing logged yet today</div>
+                : <>
+                    {todayWalkMins > 0 && <div style={{ fontSize:28, fontWeight:800, color:"#1e293b" }}>{todayWalkMins}<span style={{ fontSize:14, color:"#94a3b8", fontWeight:500 }}> mins walked</span></div>}
+                    {todayWalks.map((w,i) => (
+                      <div key={i} style={{ fontSize:12, color:"#64748b", marginTop:4 }}>
+                        {w.distance==="daycare" ? "🐾 Daycare day" : `🦮 ${w.duration_mins} min${w.distance?` · ${w.distance}`:""}`}
+                        {w.note ? ` — ${w.note}` : ""}
+                      </div>
+                    ))}
+                  </>}
+            </Card>
+            <SectionTitle>Recent activity</SectionTitle>
+            <Card>
+              {walks.length===0&&<div style={{ textAlign:"center", padding:"16px 0", color:"#94a3b8", fontSize:13 }}>No activity logged yet</div>}
+              {walks.slice(0,15).map((w,i)=>(
+                <LogItem key={i}
+                  icon={w.distance==="daycare"?"🐾":"🦮"}
+                  primary={w.distance==="daycare" ? "Doggy daycare day" : `${w.duration_mins} min${w.distance?` · ${w.distance}`:""}`}
+                  secondary={w.note}
+                  time={formatTime(w.created_at)}
+                  by={`by ${w.logged_by}`}
+                />
+              ))}
+            </Card>
           </div>
         )}
 
-        {/* HEALTH */}
+        {/* ── HEALTH ── */}
         {tab==="health" && (
           <div>
-            {[{key:"flea",label:"Flea treatment",icon:"🐛",days:fleaDays,cycle:28},{key:"worm",label:"Worming",icon:"🪱",days:wormDays,cycle:90}].map(({key,label,icon,days,cycle})=>(
-              <div key={key} style={S.card}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
-                  <div><h3 style={S.cardTitle}>{icon} {label}</h3>
-                    <div style={{color:"#8B6A55",fontSize:11}}>{treatments[key]?`Last done ${days===0?"today":`${days}d ago`} by ${treatments[key].logged_by}`:"Not yet logged"}</div>
+            {[{key:"flea",label:"Flea treatment",icon:"🐛",days:fleaDays,cycle:28,interval:"Every 28 days"},{key:"worm",label:"Worming",icon:"🪱",days:wormDays,cycle:90,interval:"Every 90 days"}].map(({key,label,icon,days,cycle,interval})=>{
+              const lastDate = treatments[key]?.treated_at;
+              const nextDate = lastDate ? new Date(new Date(lastDate).getTime() + cycle*86400000) : null;
+              return (
+              <Card key={key}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
+                  <div style={{ fontSize:14, fontWeight:700, color:"#1e293b" }}>{icon} {label}</div>
+                  <Badge color={days===null?"#94a3b8":days>=cycle?"#ef4444":days>=cycle*0.75?"#f59e0b":"#10b981"}>{days===null?"Not logged":days>=cycle?"Due now!":`${cycle-days}d left`}</Badge>
+                </div>
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:12 }}>
+                  <div style={{ background:"#f8fafc", borderRadius:10, padding:"10px 12px" }}>
+                    <div style={{ fontSize:10, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.5, marginBottom:3 }}>Last done</div>
+                    <div style={{ fontSize:12, fontWeight:700, color:"#1e293b" }}>{lastDate ? formatDate(lastDate.slice(0,10)) : "Not logged"}</div>
+                    {lastDate && <div style={{ fontSize:10, color:"#94a3b8", marginTop:1 }}>{days===0?"today":`${days} days ago`}</div>}
                   </div>
-                  <div style={{borderRadius:20,padding:"4px 10px",color:"#fff",fontWeight:"bold",fontSize:11,background:days===null?"#ccc":days>=cycle?"#e74c3c":days>=cycle*0.75?"#f39c12":"#27ae60"}}>
-                    {days===null?"?":days>=cycle?"Due!":`${cycle-days}d`}
+                  <div style={{ background:"#f8fafc", borderRadius:10, padding:"10px 12px" }}>
+                    <div style={{ fontSize:10, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.5, marginBottom:3 }}>Next due</div>
+                    <div style={{ fontSize:12, fontWeight:700, color:days>=cycle?"#ef4444":"#1e293b" }}>{nextDate ? formatDate(nextDate.toISOString().slice(0,10)) : "—"}</div>
+                    {nextDate && <div style={{ fontSize:10, color:"#94a3b8", marginTop:1 }}>{interval}</div>}
                   </div>
                 </div>
-                {days!==null&&days<cycle&&<div style={{height:5,background:"#EDE0D4",borderRadius:3,marginBottom:10,overflow:"hidden"}}><div style={{height:"100%",borderRadius:3,width:`${Math.min(100,(days/cycle)*100)}%`,background:days>=cycle*0.75?"#f39c12":"#27ae60"}} /></div>}
-                <button style={S.primaryBtn} onClick={()=>logTreatment(key)}>✅ Mark {key} done</button>
+                {days!==null&&days<cycle&&<div style={{ height:6, background:"#f1f5f9", borderRadius:3, marginBottom:12, overflow:"hidden" }}><div style={{ height:"100%", borderRadius:3, width:`${Math.min(100,(days/cycle)*100)}%`, background:days>=cycle*0.75?"#f59e0b":"#10b981", transition:"width 0.5s" }} /></div>}
+                <div style={{ display:"flex", gap:8 }}>
+                  <Btn onClick={()=>logTreatment(key)} style={{ flex:1 }}>✅ Mark as done today</Btn>
+                  <div style={{ flex:1 }}>
+                    <div style={{ fontSize:10, color:"#94a3b8", fontWeight:600, marginBottom:3 }}>Or set a specific date</div>
+                    <input type="date" value={key==="flea"?treatmentDates.fleaDate:treatmentDates.wormDate} onChange={e=>setTreatmentDates(p=>({...p,[key==="flea"?"fleaDate":"wormDate"]:e.target.value}))} style={{ width:"100%", padding:"8px 10px", borderRadius:9, border:"1.5px solid #e2e8f0", fontSize:12, background:"#f8fafc", outline:"none", boxSizing:"border-box" }} />
+                    <button onClick={async()=>{ const d = key==="flea"?treatmentDates.fleaDate:treatmentDates.wormDate; if(!d)return; await api.post("/api/treatments",{type:key,logged_by:"App",treated_at:new Date(d+"T12:00:00").toISOString()}); setTreatments(await api.get("/api/treatments")); }} style={{ marginTop:4, width:"100%", padding:"7px", borderRadius:9, border:"none", background:"#f1f5f9", cursor:"pointer", fontSize:12, fontWeight:600, color:"#334155" }}>Set date</button>
+                  </div>
+                </div>
+              </Card>
+              );
+            })}
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>😄 Mood log</div>
+              <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10 }}>
+                {MOODS.map(m=><button key={m.v} onClick={()=>setSelMood(m.v)} style={{ padding:"8px 12px", borderRadius:10, border:`2px solid ${selMood===m.v?"#1a1a2e":"#e2e8f0"}`, background:selMood===m.v?"#1a1a2e":"#fff", color:selMood===m.v?"#fff":"#64748b", cursor:"pointer", fontSize:12, fontWeight:600, display:"flex", alignItems:"center", gap:4 }}>{m.e} {m.l}</button>)}
               </div>
-            ))}
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>😄 Mood log</h3>
-              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
-                {MOODS.map(m=>(
-                  <button key={m.v} style={{...S.chipBtn,fontSize:11,...(selectedMood===m.v?S.chipActive:{})}} onClick={()=>setSelectedMood(m.v)}>{m.l}</button>
-                ))}
+              <Input placeholder="Any notes?" value={moodNote} onChange={e=>setMoodNote(e.target.value)} />
+              <Btn onClick={logMood}>Log mood</Btn>
+            </Card>
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>💊 Medication log</div>
+              <Input placeholder="Medicine name" value={medName} onChange={e=>setMedName(e.target.value)} />
+              <Input placeholder="Dose (e.g. 1 tablet, 5ml)" value={medDose} onChange={e=>setMedDose(e.target.value)} />
+              <Input placeholder="Notes (optional)" value={medNote} onChange={e=>setMedNote(e.target.value)} />
+              <Btn onClick={logMed}>+ Log medication</Btn>
+              {meds.slice(0,5).map((m,i)=><LogItem key={i} icon="💊" primary={`${m.name}${m.dose?` · ${m.dose}`:""}`} secondary={m.note} time={formatTime(m.created_at)} by={`by ${m.logged_by}`} />)}
+            </Card>
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>⚖️ Weight tracker</div>
+              <div style={{ display:"flex", gap:8, marginBottom:10, alignItems:"center" }}>
+                <Input type="number" placeholder="Weight in kg" value={newWeight} onChange={e=>setNewWeight(e.target.value)} style={{ flex:1, marginBottom:0 }} />
+                <Btn onClick={logWeight} style={{ width:"auto", padding:"10px 16px" }}>Log</Btn>
               </div>
-              <input style={S.input} placeholder="Any notes?" value={moodNote} onChange={e=>setMoodNote(e.target.value)} />
-              <button style={S.primaryBtn} onClick={logMood}>Log mood</button>
-              {mood.slice(0,3).map((m,i)=>(
-                <div key={i} style={{...S.logItem,marginTop:8}}>
-                  <div style={{display:"flex",alignItems:"center",gap:10}}>
-                    <span style={{fontSize:18}}>{MOODS.find(x=>x.v===m.mood)?.l.split(" ")[1]||"😐"}</span>
-                    <div><div style={S.logPrimary}>{MOODS.find(x=>x.v===m.mood)?.l||m.mood}</div>{m.note&&<div style={S.logNote}>{m.note}</div>}</div>
-                  </div>
-                  <div style={{textAlign:"right"}}><div style={S.logTime}>{formatDate(m.logged_date)}</div><div style={S.logUser}>by {m.logged_by}</div></div>
-                </div>
-              ))}
-            </div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>💊 Medication log</h3>
-              <input style={S.input} placeholder="Medicine name" value={medName} onChange={e=>setMedName(e.target.value)} />
-              <input style={S.input} placeholder="Dose (e.g. 1 tablet, 5ml)" value={medDose} onChange={e=>setMedDose(e.target.value)} />
-              <input style={S.input} placeholder="Notes (optional)" value={medNote} onChange={e=>setMedNote(e.target.value)} />
-              <button style={S.primaryBtn} onClick={logMed}>+ Log medication</button>
-              {meds.slice(0,5).map((m,i)=>(
-                <div key={i} style={{...S.logItem,marginTop:8}}>
-                  <div style={{display:"flex",alignItems:"center",gap:10}}>
-                    <span style={{fontSize:18}}>💊</span>
-                    <div><div style={S.logPrimary}>{m.name}{m.dose?` · ${m.dose}`:""}</div>{m.note&&<div style={S.logNote}>{m.note}</div>}</div>
-                  </div>
-                  <div style={{textAlign:"right"}}><div style={S.logTime}>{formatTime(m.created_at)}</div><div style={S.logUser}>by {m.logged_by}</div></div>
-                </div>
-              ))}
-            </div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>⚖️ Weight tracker</h3>
-              <div style={{display:"flex",gap:8,marginBottom:10,alignItems:"center"}}>
-                <input type="number" step="0.1" style={{...S.input,flex:1,marginBottom:0}} placeholder="Weight in kg" value={newWeight} onChange={e=>setNewWeight(e.target.value)} />
-                <button style={{...S.primaryBtn,width:"auto",padding:"9px 14px"}} onClick={logWeight}>Log</button>
+              {weight.length>1&&<ResponsiveContainer width="100%" height={120}><LineChart data={weight}><XAxis dataKey="logged_date" tick={{fontSize:8,fill:"#94a3b8"}} tickFormatter={d=>d.slice(5)} axisLine={false} tickLine={false} /><YAxis tick={{fontSize:8,fill:"#94a3b8"}} domain={["auto","auto"]} width={28} axisLine={false} tickLine={false} /><Tooltip formatter={v=>[`${v}kg`,"Weight"]} contentStyle={{fontSize:11,borderRadius:8,border:"none",boxShadow:"0 4px 12px rgba(0,0,0,0.1)"}} /><Line type="monotone" dataKey="weight_kg" stroke="#1a1a2e" strokeWidth={2} dot={{r:3,fill:"#1a1a2e"}} /></LineChart></ResponsiveContainer>}
+              {weight.slice(-5).reverse().map((w,i)=><div key={i} style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:"#64748b", padding:"5px 0", borderBottom:"1px solid #f1f5f9" }}><span>{formatDate(w.logged_date)}</span><span style={{ fontWeight:700, color:"#1e293b" }}>{w.weight_kg}kg</span><span>{w.logged_by}</span></div>)}
+            </Card>
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>🔍 Behaviour notes</div>
+              <div style={{ display:"flex", gap:5, flexWrap:"wrap", marginBottom:10 }}>
+                {BEHAVIOUR_TYPES.map(b=><Chip key={b} label={b} active={behavType===b} onClick={()=>setBehavType(b)} />)}
               </div>
-              {weight.length > 1 && (
-                <ResponsiveContainer width="100%" height={120}>
-                  <LineChart data={weight}>
-                    <XAxis dataKey="logged_date" tick={{fontSize:8}} tickFormatter={d=>d.slice(5)} />
-                    <YAxis tick={{fontSize:8}} domain={["auto","auto"]} width={28} />
-                    <Tooltip formatter={v=>[`${v}kg`,"Weight"]} contentStyle={{fontSize:10}} />
-                    <Line type="monotone" dataKey="weight_kg" stroke="#3D2B1F" strokeWidth={2} dot={{r:2}} />
-                  </LineChart>
-                </ResponsiveContainer>
-              )}
-              {weight.slice(-5).reverse().map((w,i)=>(
-                <div key={i} style={{display:"flex",justifyContent:"space-between",fontSize:11,color:"#6B4F3A",padding:"3px 0",borderBottom:"1px solid #EDE0D4"}}>
-                  <span>{formatDate(w.logged_date)}</span><span style={{fontWeight:"bold"}}>{w.weight_kg} kg</span><span>{w.logged_by}</span>
-                </div>
-              ))}
-            </div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>🔍 Behaviour notes</h3>
-              <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:8}}>
-                {BEHAVIOUR_TYPES.map(b=>(
-                  <button key={b} style={{...S.chipBtn,fontSize:10,padding:"4px 8px",...(behavType===b?S.chipActive:{})}} onClick={()=>setBehavType(b)}>{b}</button>
-                ))}
-              </div>
-              <input style={S.input} placeholder="More details..." value={behavNote} onChange={e=>setBehavNote(e.target.value)} />
-              <button style={S.primaryBtn} onClick={logBehaviour}>+ Log note</button>
-              {behaviour.slice(0,5).map((b,i)=>(
-                <div key={i} style={{...S.logItem,marginTop:8}}>
-                  <div style={{display:"flex",alignItems:"center",gap:10,flex:1}}>
-                    <span style={{fontSize:18}}>🔍</span>
-                    <div><div style={S.logPrimary}>{b.type}</div>{b.note&&<div style={S.logNote}>{b.note}</div>}</div>
-                  </div>
-                  <div style={{textAlign:"right"}}><div style={S.logTime}>{formatTime(b.created_at)}</div><div style={S.logUser}>by {b.logged_by}</div></div>
-                </div>
-              ))}
-            </div>
+              <Input placeholder="More details..." value={behavNote} onChange={e=>setBehavNote(e.target.value)} />
+              <Btn onClick={logBehaviour}>+ Log note</Btn>
+              {behaviour.slice(0,5).map((b,i)=><LogItem key={i} icon="🔍" primary={b.type} secondary={b.note} time={formatTime(b.created_at)} by={`by ${b.logged_by}`} />)}
+            </Card>
           </div>
         )}
 
-        {/* VET */}
+        {/* ── VET ── */}
         {tab==="vet" && (
           <div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>Add appointment</h3>
-              <div style={{display:"flex",gap:8,marginBottom:10}}>
-                <button style={{...S.chipBtn,...(vetIsUpcoming?S.chipActive:{})}} onClick={()=>setVetIsUpcoming(true)}>Upcoming</button>
-                <button style={{...S.chipBtn,...(!vetIsUpcoming?S.chipActive:{})}} onClick={()=>setVetIsUpcoming(false)}>Past visit</button>
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>Add appointment</div>
+              <div style={{ display:"flex", gap:6, marginBottom:12 }}>
+                <Chip label="Upcoming" active={vetUpcoming} onClick={()=>setVetUpcoming(true)} />
+                <Chip label="Past visit" active={!vetUpcoming} onClick={()=>setVetUpcoming(false)} />
               </div>
-              <input type="date" style={S.input} value={vetDate} onChange={e=>setVetDate(e.target.value)} />
-              <input style={S.input} placeholder="Reason (e.g. annual checkup)" value={vetReason} onChange={e=>setVetReason(e.target.value)} />
-              <input style={S.input} placeholder="Notes (e.g. what vet said)" value={vetNotes} onChange={e=>setVetNotes(e.target.value)} />
-              <button style={S.primaryBtn} onClick={addVetAppt}>🏥 Save appointment</button>
-            </div>
-            {upcomingVet.length>0&&<><h3 style={S.sectionTitle}>Upcoming</h3>
-              {upcomingVet.map(a=>(
-                <div key={a.id} style={{...S.eventCard,borderLeft:"4px solid #27ae60",marginBottom:8}}>
-                  <div style={{flex:1}}>
-                    <div style={{fontWeight:"bold",color:"#3D2B1F",fontSize:12}}>🏥 {a.reason}</div>
-                    <div style={{fontSize:10,color:"#8B6A55"}}>{formatDate(a.appt_date)} · {a.added_by}</div>
-                    {a.notes&&<div style={{fontSize:10,color:"#6B4F3A",marginTop:1}}>📝 {a.notes}</div>}
-                  </div>
-                  <button style={S.delBtn} onClick={()=>deleteVetAppt(a.id)}>✕</button>
-                </div>
-              ))}</>}
-            <h3 style={S.sectionTitle}>All appointments</h3>
-            {vetAppts.length===0&&<div style={S.empty}>No appointments logged yet</div>}
-            {vetAppts.filter(a=>!a.upcoming||a.appt_date<today).map(a=>(
-              <div key={a.id} style={{...S.eventCard,borderLeft:"4px solid #8B6A55",marginBottom:8}}>
-                <div style={{flex:1}}>
-                  <div style={{fontWeight:"bold",color:"#3D2B1F",fontSize:12}}>🏥 {a.reason}</div>
-                  <div style={{fontSize:10,color:"#8B6A55"}}>{formatDate(a.appt_date)} · {a.added_by}</div>
-                  {a.notes&&<div style={{fontSize:10,color:"#6B4F3A",marginTop:1}}>📝 {a.notes}</div>}
-                </div>
-                <button style={S.delBtn} onClick={()=>deleteVetAppt(a.id)}>✕</button>
-              </div>
-            ))}
+              <Input type="date" value={vetDate} onChange={e=>setVetDate(e.target.value)} />
+              <Input placeholder="Reason (e.g. annual checkup)" value={vetReason} onChange={e=>setVetReason(e.target.value)} />
+              <Input placeholder="Notes (e.g. what vet said)" value={vetNotes} onChange={e=>setVetNotes(e.target.value)} />
+              <Btn onClick={addVetAppt}>🏥 Save appointment</Btn>
+            </Card>
+            {upcomingVet.length>0&&<><SectionTitle>Upcoming</SectionTitle>{upcomingVet.map(a=><div key={a.id} style={{ background:"#fff", borderRadius:14, padding:"12px 14px", marginBottom:8, display:"flex", alignItems:"center", gap:12, boxShadow:"0 1px 3px rgba(0,0,0,0.06)", borderLeft:"4px solid #10b981" }}><div style={{ flex:1 }}><div style={{ fontSize:13, fontWeight:600, color:"#1e293b" }}>🏥 {a.reason}</div><div style={{ fontSize:11, color:"#94a3b8", marginTop:2 }}>{formatDate(a.appt_date)}</div>{a.notes&&<div style={{ fontSize:11, color:"#64748b", marginTop:2 }}>📝 {a.notes}</div>}</div><button onClick={()=>deleteVetAppt(a.id)} style={{ background:"#fef2f2", border:"none", borderRadius:8, padding:"5px 9px", cursor:"pointer", color:"#ef4444", fontSize:12, fontWeight:700 }}>✕</button></div>)}</>}
+            <SectionTitle>Past visits</SectionTitle>
+            {vetAppts.filter(a=>!a.upcoming||a.appt_date<today).length===0&&<Card><div style={{ textAlign:"center", color:"#94a3b8", fontSize:13 }}>No past visits logged yet</div></Card>}
+            {vetAppts.filter(a=>!a.upcoming||a.appt_date<today).map(a=><div key={a.id} style={{ background:"#fff", borderRadius:14, padding:"12px 14px", marginBottom:8, display:"flex", alignItems:"center", gap:12, boxShadow:"0 1px 3px rgba(0,0,0,0.06)", borderLeft:"4px solid #94a3b8" }}><div style={{ flex:1 }}><div style={{ fontSize:13, fontWeight:600, color:"#1e293b" }}>🏥 {a.reason}</div><div style={{ fontSize:11, color:"#94a3b8", marginTop:2 }}>{formatDate(a.appt_date)}</div>{a.notes&&<div style={{ fontSize:11, color:"#64748b", marginTop:2 }}>📝 {a.notes}</div>}</div><button onClick={()=>deleteVetAppt(a.id)} style={{ background:"#fef2f2", border:"none", borderRadius:8, padding:"5px 9px", cursor:"pointer", color:"#ef4444", fontSize:12, fontWeight:700 }}>✕</button></div>)}
           </div>
         )}
 
-        {/* GROOMING */}
+        {/* ── GROOMING ── */}
         {tab==="grooming" && (
           <div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>✂️ Log grooming</h3>
-              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
-                {GROOMING_TYPES.map(g=>(
-                  <button key={g} style={{...S.chipBtn,...(groomType===g?S.chipActive:{})}} onClick={()=>setGroomType(g)}>{g}</button>
-                ))}
-              </div>
-              <input style={S.input} placeholder="Notes (optional)" value={groomNote} onChange={e=>setGroomNote(e.target.value)} />
-              <button style={S.primaryBtn} onClick={logGrooming}>✂️ Log grooming</button>
-            </div>
-            <h3 style={S.sectionTitle}>Recent grooming</h3>
-            {grooming.length===0&&<div style={S.empty}>No grooming logged yet</div>}
-            {grooming.slice(0,15).map((g,i)=>(
-              <div key={i} style={S.logItem}>
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <span style={{fontSize:18}}>✂️</span>
-                  <div><div style={S.logPrimary}>{g.type}</div>{g.note&&<div style={S.logNote}>{g.note}</div>}</div>
+            {/* Summary at top */}
+            <Card>
+              <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:12 }}>✂️ Grooming summary</div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:14 }}>
+                <div style={{ background:"#f8fafc", borderRadius:10, padding:"10px 12px" }}>
+                  <div style={{ fontSize:10, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.5, marginBottom:3 }}>Last groomed</div>
+                  {grooming.length>0 ? <>
+                    <div style={{ fontSize:12, fontWeight:700, color:"#1e293b" }}>{formatDate(grooming[0].created_at.slice(0,10))}</div>
+                    <div style={{ fontSize:10, color:"#94a3b8", marginTop:1 }}>{grooming[0].type}</div>
+                  </> : <div style={{ fontSize:12, color:"#94a3b8" }}>Not logged</div>}
                 </div>
-                <div style={{textAlign:"right"}}><div style={S.logTime}>{formatTime(g.created_at)}</div><div style={S.logUser}>by {g.logged_by}</div></div>
+                <div style={{ background:"#f8fafc", borderRadius:10, padding:"10px 12px" }}>
+                  <div style={{ fontSize:10, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.5, marginBottom:3 }}>Next appointment</div>
+                  {groomNextAppt ? <>
+                    <div style={{ fontSize:12, fontWeight:700, color:"#1e293b" }}>{formatDate(groomNextAppt)}</div>
+                    <div style={{ fontSize:10, color:"#94a3b8", marginTop:1 }}>booked</div>
+                  </> : <div style={{ fontSize:12, color:"#94a3b8" }}>Not set</div>}
+                </div>
               </div>
-            ))}
+              <div style={{ fontSize:11, color:"#94a3b8", fontWeight:600, marginBottom:4 }}>Next appointment date</div>
+              <div style={{ display:"flex", gap:8 }}>
+                <input type="date" value={groomNextAppt} onChange={e=>setGroomNextAppt(e.target.value)} style={{ flex:1, padding:"8px 10px", borderRadius:9, border:"1.5px solid #e2e8f0", fontSize:13, background:"#f8fafc", outline:"none", boxSizing:"border-box" }} />
+                {groomNextAppt && <button onClick={()=>setGroomNextAppt("")} style={{ padding:"8px 12px", borderRadius:9, border:"none", background:"#fef2f2", cursor:"pointer", fontSize:12, fontWeight:600, color:"#ef4444" }}>Clear</button>}
+              </div>
+            </Card>
+            {/* Log section below */}
+            <SectionTitle>Log grooming</SectionTitle>
+            <Card>
+              <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10 }}>
+                {GROOMING_TYPES.map(g=><Chip key={g} label={g} active={groomType===g} onClick={()=>setGroomType(g)} />)}
+              </div>
+              <Input placeholder="Notes (optional)" value={groomNote} onChange={e=>setGroomNote(e.target.value)} />
+              <Btn onClick={logGrooming}>✂️ Log grooming session</Btn>
+            </Card>
+            <SectionTitle>Recent grooming</SectionTitle>
+            <Card>{grooming.length===0&&<div style={{ textAlign:"center", padding:"16px 0", color:"#94a3b8", fontSize:13 }}>No grooming logged yet</div>}{grooming.slice(0,15).map((g,i)=><LogItem key={i} icon="✂️" primary={g.type} secondary={g.note} time={formatTime(g.created_at)} by={`by ${g.logged_by}`} />)}</Card>
           </div>
         )}
 
-        {/* TRAINING */}
-        {tab==="training" && (
-          <div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>🎓 Log training session</h3>
-              <input style={S.input} placeholder="Commands practised (e.g. sit, stay, recall)" value={trainCommands} onChange={e=>setTrainCommands(e.target.value)} />
-              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
-                {["Excellent","Good","Okay","Struggling"].map(r=>(
-                  <button key={r} style={{...S.chipBtn,...(trainRating===r?S.chipActive:{})}} onClick={()=>setTrainRating(r)}>{r}</button>
-                ))}
-              </div>
-              <input style={S.input} placeholder="Notes (e.g. great focus today!)" value={trainNote} onChange={e=>setTrainNote(e.target.value)} />
-              <button style={S.primaryBtn} onClick={logTraining}>🎓 Log session</button>
-            </div>
-            <h3 style={S.sectionTitle}>Recent sessions</h3>
-            {training.length===0&&<div style={S.empty}>No training logged yet</div>}
-            {training.slice(0,15).map((t,i)=>(
-              <div key={i} style={S.logItem}>
-                <div style={{display:"flex",alignItems:"center",gap:10,flex:1}}>
-                  <span style={{fontSize:18}}>🎓</span>
-                  <div><div style={S.logPrimary}>{t.commands}</div><div style={S.logNote}>{t.rating}{t.note?` · ${t.note}`:""}</div></div>
-                </div>
-                <div style={{textAlign:"right"}}><div style={S.logTime}>{formatTime(t.created_at)}</div><div style={S.logUser}>by {t.logged_by}</div></div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* MILESTONES */}
-        {tab==="milestones" && (
-          <div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>⭐ Add a milestone</h3>
-              <input type="date" style={S.input} value={milestoneDate} onChange={e=>setMilestoneDate(e.target.value)} />
-              <input style={S.input} placeholder="What happened? (e.g. first swim!)" value={milestoneTitle} onChange={e=>setMilestoneTitle(e.target.value)} />
-              <input style={S.input} placeholder="More details (optional)" value={milestoneNote} onChange={e=>setMilestoneNote(e.target.value)} />
-              <button style={S.primaryBtn} onClick={addMilestone}>⭐ Save milestone</button>
-            </div>
-            <h3 style={S.sectionTitle}>Barney's moments</h3>
-            {milestones.length===0&&<div style={S.empty}>No milestones yet — add Barney's first one! 🐾</div>}
-            {milestones.map((m,i)=>(
-              <div key={i} style={{...S.eventCard,borderLeft:"4px solid #C4A85A",marginBottom:8}}>
-                <div style={{flex:1}}>
-                  <div style={{fontWeight:"bold",color:"#3D2B1F",fontSize:13}}>⭐ {m.title}</div>
-                  <div style={{fontSize:10,color:"#8B6A55"}}>{formatDate(m.milestone_date)} · {m.added_by}</div>
-                  {m.note&&<div style={{fontSize:10,color:"#6B4F3A",marginTop:1}}>📝 {m.note}</div>}
-                </div>
-                <button style={S.delBtn} onClick={()=>deleteMilestone(m.id)}>✕</button>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* EXPENSES */}
-        {tab==="expenses" && (
-          <div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>💰 Log an expense</h3>
-              <input type="date" style={S.input} value={expDate} onChange={e=>setExpDate(e.target.value)} />
-              <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:10}}>
-                {EXPENSE_CATS.map(c=>(
-                  <button key={c} style={{...S.chipBtn,fontSize:11,padding:"4px 10px",...(expCat===c?S.chipActive:{})}} onClick={()=>setExpCat(c)}>{c}</button>
-                ))}
-              </div>
-              <div style={{display:"flex",gap:8,marginBottom:10}}>
-                <div style={{position:"relative",flex:1}}>
-                  <span style={{position:"absolute",left:12,top:"50%",transform:"translateY(-50%)",color:"#8B6A55",fontSize:14}}>£</span>
-                  <input type="number" step="0.01" style={{...S.input,marginBottom:0,paddingLeft:24}} placeholder="0.00" value={expAmount} onChange={e=>setExpAmount(e.target.value)} />
-                </div>
-              </div>
-              <input style={S.input} placeholder="Description (optional)" value={expDesc} onChange={e=>setExpDesc(e.target.value)} />
-              <button style={S.primaryBtn} onClick={addExpense}>💰 Save expense</button>
-            </div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>This month</h3>
-              <div style={{fontSize:28,fontWeight:"bold",color:"#3D2B1F"}}>£{thisMonthExp.toFixed(2)}</div>
-              <div style={{marginTop:8}}>
-                {EXPENSE_CATS.map(cat=>{
-                  const total = expenses.filter(e=>e.expense_date?.slice(0,7)===today.slice(0,7)&&e.category===cat).reduce((s,e)=>s+e.amount,0);
-                  if (!total) return null;
-                  return <div key={cat} style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"#6B4F3A",padding:"2px 0"}}><span>{cat}</span><span>£{total.toFixed(2)}</span></div>;
-                })}
-              </div>
-            </div>
-            <h3 style={S.sectionTitle}>All expenses</h3>
-            {expenses.length===0&&<div style={S.empty}>No expenses logged yet</div>}
-            {expenses.map((e,i)=>(
-              <div key={i} style={{...S.logItem,marginBottom:6}}>
-                <div style={{display:"flex",alignItems:"center",gap:10,flex:1}}>
-                  <span style={{fontSize:18}}>💰</span>
-                  <div><div style={S.logPrimary}>{e.category} · £{parseFloat(e.amount).toFixed(2)}</div>{e.description&&<div style={S.logNote}>{e.description}</div>}</div>
-                </div>
-                <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
-                  <div style={S.logTime}>{formatDate(e.expense_date)}</div>
-                  <div style={S.logUser}>{e.added_by}</div>
-                  <button style={S.delBtn} onClick={()=>deleteExpense(e.id)}>✕</button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* INFO */}
+        {/* ── INFO ── */}
         {tab==="info" && (
           <div>
-            {!editingInfo ? (
-              <div style={S.card}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-                  <h3 style={{...S.cardTitle,margin:0}}>📋 Barney's Info</h3>
-                  <button style={S.addBtn} onClick={()=>{setInfoEdit({...info});setEditingInfo(true);}}>Edit</button>
+            {!editingInfo?(
+              <Card>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+                  <div style={{ fontSize:13, fontWeight:700, color:"#1e293b" }}>📋 Barney's Info</div>
+                  <Btn onClick={()=>{setInfoEdit({...info});setEditingInfo(true);}} style={{ width:"auto", padding:"6px 14px", borderRadius:20, fontSize:12 }}>Edit</Btn>
                 </div>
-                {[
-                  {label:"Microchip",icon:"🔖",val:info.microchip},
-                  {label:"Vet practice",icon:"🏥",val:info.vet},
-                  {label:"Vet phone",icon:"📞",val:info.vet_phone},
-                  {label:"Insurance",icon:"📄",val:info.insurance},
-                  {label:"Emergency contact",icon:"🚨",val:info.emergency_name},
-                  {label:"Emergency phone",icon:"📞",val:info.emergency_phone},
-                ].map(({label,icon,val})=>(
-                  <div key={label} style={{padding:"8px 0",borderBottom:"1px solid #EDE0D4"}}>
-                    <div style={{fontSize:10,color:"#8B6A55",marginBottom:1}}>{icon} {label}</div>
-                    <div style={{fontSize:13,color:val?"#3D2B1F":"#ccc",fontWeight:val?"bold":"normal"}}>{val||"Not set"}</div>
+                {[{label:"Microchip",icon:"🔖",val:info.microchip},{label:"Vet practice",icon:"🏥",val:info.vet},{label:"Vet phone",icon:"📞",val:info.vet_phone},{label:"Insurance",icon:"📄",val:info.insurance},{label:"Emergency contact",icon:"🚨",val:info.emergency_name},{label:"Emergency phone",icon:"📞",val:info.emergency_phone}].map(({label,icon,val})=>(
+                  <div key={label} style={{ padding:"10px 0", borderBottom:"1px solid #f1f5f9" }}>
+                    <div style={{ fontSize:10, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.5, marginBottom:2 }}>{icon} {label}</div>
+                    <div style={{ fontSize:13, fontWeight:val?600:400, color:val?"#1e293b":"#cbd5e1" }}>{val||"Not set"}</div>
                   </div>
                 ))}
-                {info.notes&&<div style={{marginTop:10}}><div style={{fontSize:10,color:"#8B6A55",marginBottom:3}}>📝 Notes</div><div style={{fontSize:12,color:"#3D2B1F"}}>{info.notes}</div></div>}
-              </div>
-            ) : (
-              <div style={S.card}>
-                <h3 style={S.cardTitle}>Edit Info</h3>
-                {[
-                  {key:"microchip",label:"Microchip number"},
-                  {key:"vet",label:"Vet practice name"},
-                  {key:"vet_phone",label:"Vet phone number"},
-                  {key:"insurance",label:"Insurance provider / policy"},
-                  {key:"emergency_name",label:"Emergency contact name"},
-                  {key:"emergency_phone",label:"Emergency contact phone"},
-                ].map(({key,label})=>(
-                  <div key={key}>
-                    <div style={{fontSize:10,color:"#8B6A55",marginBottom:2}}>{label}</div>
-                    <input style={S.input} value={infoEdit[key]||""} onChange={e=>setInfoEdit(p=>({...p,[key]:e.target.value}))} />
-                  </div>
+                {info.notes&&<div style={{ marginTop:12 }}><div style={{ fontSize:10, color:"#94a3b8", fontWeight:600, textTransform:"uppercase", letterSpacing:0.5, marginBottom:4 }}>📝 Notes</div><div style={{ fontSize:13, color:"#334155", lineHeight:1.5 }}>{info.notes}</div></div>}
+              </Card>
+            ):(
+              <Card>
+                <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:14 }}>Edit Info</div>
+                {[{key:"microchip",label:"Microchip number"},{key:"vet",label:"Vet practice name"},{key:"vet_phone",label:"Vet phone number"},{key:"insurance",label:"Insurance provider"},{key:"emergency_name",label:"Emergency contact name"},{key:"emergency_phone",label:"Emergency contact phone"}].map(({key,label})=>(
+                  <div key={key}><div style={{ fontSize:11, color:"#94a3b8", fontWeight:600, marginBottom:3 }}>{label}</div><Input value={infoEdit[key]||""} onChange={e=>setInfoEdit(p=>({...p,[key]:e.target.value}))} /></div>
                 ))}
-                <div style={{fontSize:10,color:"#8B6A55",marginBottom:2}}>Notes</div>
-                <textarea style={{...S.input,height:70,resize:"vertical"}} value={infoEdit.notes||""} onChange={e=>setInfoEdit(p=>({...p,notes:e.target.value}))} />
-                <div style={{display:"flex",gap:8}}>
-                  <button style={{...S.primaryBtn,flex:1}} onClick={saveInfo}>Save</button>
-                  <button style={{...S.primaryBtn,flex:1,background:"#EDE0D4",color:"#3D2B1F"}} onClick={()=>setEditingInfo(false)}>Cancel</button>
+                <div style={{ fontSize:11, color:"#94a3b8", fontWeight:600, marginBottom:3 }}>Notes</div>
+                <textarea value={infoEdit.notes||""} onChange={e=>setInfoEdit(p=>({...p,notes:e.target.value}))} style={{ width:"100%", padding:"10px 14px", borderRadius:10, border:"1.5px solid #e2e8f0", fontSize:13, background:"#f8fafc", marginBottom:10, boxSizing:"border-box", outline:"none", fontFamily:"inherit", height:80, resize:"vertical" }} />
+                <div style={{ display:"flex", gap:8 }}>
+                  <Btn onClick={saveInfo} style={{ flex:1 }}>Save</Btn>
+                  <Btn variant="secondary" onClick={()=>setEditingInfo(false)} style={{ flex:1 }}>Cancel</Btn>
                 </div>
-              </div>
+              </Card>
             )}
-          </div>
-        )}
-
-        {/* PHOTOS */}
-        {tab==="photos" && (
-          <div>
-            <div style={S.card}>
-              <h3 style={S.cardTitle}>📸 Add a photo</h3>
-              <label style={{display:"block",background:"#EDE0D4",borderRadius:10,padding:"18px",textAlign:"center",cursor:"pointer",marginBottom:10,border:"2px dashed #D4A574"}}>
-                <div style={{fontSize:28}}>📷</div>
-                <div style={{fontSize:12,color:"#6B4F3A",marginTop:3}}>Tap to choose a photo</div>
-                <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>setPhotoData(ev.target.result);r.readAsDataURL(f);}} />
-              </label>
-              {photoData&&<img src={photoData} style={{width:"100%",borderRadius:10,marginBottom:10,maxHeight:180,objectFit:"cover"}} />}
-              <input style={S.input} placeholder="Caption (e.g. first day at daycare!)" value={photoCaption} onChange={e=>setPhotoCaption(e.target.value)} />
-              <button style={{...S.primaryBtn,opacity:photoData?1:0.5}} onClick={savePhoto}>Save photo</button>
-            </div>
-            {photos.length===0&&<div style={S.empty}>No photos yet — add one! 🐶</div>}
-            {photos.map(p=>(
-              <div key={p.id} style={{...S.card,padding:0,overflow:"hidden",marginBottom:12}}>
-                {p.data&&<img src={p.data} style={{width:"100%",maxHeight:200,objectFit:"cover",display:"block"}} />}
-                <div style={{padding:"8px 12px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                  <div>{p.caption&&<div style={{fontSize:12,fontWeight:"bold",color:"#3D2B1F"}}>{p.caption}</div>}<div style={{fontSize:10,color:"#8B6A55"}}>{formatDate(p.photo_date)} · {p.added_by}</div></div>
-                  <button style={S.delBtn} onClick={()=>deletePhoto(p.id)}>✕</button>
-                </div>
-              </div>
-            ))}
           </div>
         )}
 
@@ -929,42 +957,3 @@ export default function BarneyApp() {
     </div>
   );
 }
-
-const S = {
-  app:         { fontFamily:"'Georgia',serif", background:"#FDF8F3", minHeight:"100vh", maxWidth:480, margin:"0 auto", display:"flex", flexDirection:"column" },
-  splash:      { minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"#FDF8F3", gap:16, padding:24 },
-  userBtn:     { background:"#fff", border:"2px solid #D4A574", borderRadius:14, padding:"16px 22px", cursor:"pointer", fontSize:14, display:"flex", flexDirection:"column", alignItems:"center", gap:7, color:"#3D2B1F", fontWeight:"bold", boxShadow:"0 2px 8px rgba(0,0,0,0.08)" },
-  header:      { background:"#3D2B1F", color:"#FDF8F3", padding:"11px 16px", display:"flex", justifyContent:"space-between", alignItems:"center", flexShrink:0 },
-  switchBtn:   { background:"rgba(255,255,255,0.15)", border:"none", color:"#FDF8F3", padding:"4px 11px", borderRadius:20, cursor:"pointer", fontSize:11 },
-  alertBar:    { background:"#e74c3c", color:"#fff", padding:"6px 14px", fontSize:11, fontWeight:"bold", display:"flex", gap:12, flexWrap:"wrap", flexShrink:0 },
-  tabBar:      { display:"flex", background:"#fff", borderBottom:"2px solid #EDE0D4", overflowX:"auto", flexShrink:0 },
-  tabBtn:      { minWidth:48, padding:"8px 4px", border:"none", background:"transparent", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:1, color:"#8B6A55", fontSize:14, flexShrink:0 },
-  tabActive:   { color:"#3D2B1F", borderBottom:"3px solid #D4A574" },
-  content:     { flex:1, padding:12, overflowY:"auto" },
-  card:        { background:"#fff", borderRadius:12, padding:16, marginBottom:12, boxShadow:"0 2px 8px rgba(0,0,0,0.05)", border:"1px solid #EDE0D4" },
-  cardTitle:   { margin:"0 0 10px", color:"#3D2B1F", fontSize:14, fontWeight:"bold" },
-  sectionTitle:{ color:"#6B4F3A", fontSize:11, fontWeight:"bold", textTransform:"uppercase", letterSpacing:1, margin:"12px 0 6px" },
-  input:       { width:"100%", padding:"8px 11px", borderRadius:8, border:"1px solid #D4A574", fontSize:13, color:"#3D2B1F", background:"#FDF8F3", marginBottom:9, boxSizing:"border-box", outline:"none", fontFamily:"inherit" },
-  timeInput:   { width:"100%", padding:"8px 11px", borderRadius:8, border:"1px solid #D4A574", fontSize:13, color:"#3D2B1F", background:"#FDF8F3", boxSizing:"border-box", outline:"none" },
-  primaryBtn:  { width:"100%", padding:11, background:"#3D2B1F", color:"#FDF8F3", border:"none", borderRadius:9, cursor:"pointer", fontSize:13, fontWeight:"bold", fontFamily:"inherit" },
-  chipBtn:     { padding:"5px 11px", borderRadius:20, border:"2px solid #D4A574", background:"#fff", color:"#6B4F3A", cursor:"pointer", fontSize:12, fontWeight:"bold" },
-  chipActive:  { background:"#D4A574", color:"#fff" },
-  bigBtn:      { flex:1, padding:"16px 8px", color:"#fff", border:"none", borderRadius:11, cursor:"pointer", fontSize:14, fontWeight:"bold", display:"flex", flexDirection:"column", alignItems:"center", gap:5 },
-  logItem:     { background:"#fff", borderRadius:9, padding:"9px 12px", marginBottom:6, display:"flex", justifyContent:"space-between", alignItems:"center", boxShadow:"0 1px 4px rgba(0,0,0,0.05)", border:"1px solid #EDE0D4" },
-  logPrimary:  { fontWeight:"bold", color:"#3D2B1F", fontSize:12 },
-  logNote:     { color:"#8B6A55", fontSize:10, marginTop:1 },
-  logTime:     { fontSize:10, color:"#6B4F3A", fontWeight:"bold" },
-  logUser:     { fontSize:9, color:"#8B6A55" },
-  empty:       { color:"#8B6A55", textAlign:"center", padding:"18px 0", fontSize:13 },
-  countBtn:    { flex:1, padding:9, background:"#EDE0D4", border:"none", borderRadius:8, cursor:"pointer", fontSize:13, fontWeight:"bold", color:"#3D2B1F" },
-  navBtn:      { background:"#EDE0D4", border:"none", borderRadius:7, padding:"4px 11px", cursor:"pointer", fontSize:17, color:"#3D2B1F", fontWeight:"bold" },
-  dayCell:     { display:"flex", flexDirection:"column", alignItems:"center", gap:1, padding:"6px 2px", borderRadius:9, border:"2px solid transparent", background:"#fff", cursor:"pointer", boxShadow:"0 1px 3px rgba(0,0,0,0.05)" },
-  dayCellSel:  { background:"#3D2B1F", border:"2px solid #3D2B1F" },
-  dayCellToday:{ border:"2px solid #D4A574" },
-  addBtn:      { background:"#3D2B1F", color:"#fff", border:"none", borderRadius:20, padding:"4px 12px", cursor:"pointer", fontWeight:"bold", fontSize:11 },
-  eventCard:   { background:"#fff", borderRadius:9, padding:"9px 11px", marginBottom:7, display:"flex", alignItems:"center", justifyContent:"space-between", boxShadow:"0 1px 4px rgba(0,0,0,0.05)", border:"1px solid #EDE0D4" },
-  delBtn:      { background:"#EDE0D4", border:"none", borderRadius:20, padding:"3px 8px", cursor:"pointer", color:"#6B4F3A", fontSize:10, fontWeight:"bold", flexShrink:0 },
-  modalOverlay:{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", display:"flex", alignItems:"flex-end", justifyContent:"center", zIndex:100 },
-  modal:       { background:"#FDF8F3", borderRadius:"16px 16px 0 0", padding:20, width:"100%", maxWidth:480, maxHeight:"88vh", overflowY:"auto" },
-  locBtn:      { display:"flex", flexDirection:"column", alignItems:"center", gap:4, padding:"9px 5px", borderRadius:9, border:"2px solid #D4A574", background:"#fff", cursor:"pointer", color:"#6B4F3A", fontWeight:"bold" },
-};
