@@ -353,15 +353,16 @@ export default function BarneyApp() {
     // Handle OAuth redirect back
     const params = new URLSearchParams(window.location.search);
     if (params.get("auth") === "success") { setCalConnected(true); window.history.replaceState({}, "", window.location.pathname); }
-    // Register service worker
+    // Register service worker and wait until ready
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").then(reg => {
-        setSwReg(reg);
-        // Check if already subscribed
-        reg.pushManager.getSubscription().then(sub => {
-          if (sub) setPushStatus("granted");
-        });
-      }).catch(console.error);
+      navigator.serviceWorker.register("/sw.js")
+        .then(() => navigator.serviceWorker.ready)
+        .then(reg => {
+          setSwReg(reg);
+          return reg.pushManager.getSubscription();
+        })
+        .then(sub => { if (sub) setPushStatus("granted"); })
+        .catch(e => console.error("SW failed:", e));
     }
     // Load push subscriptions list
     api.get("/api/push/subscriptions").then(r => setPushSubs(Array.isArray(r)?r:[])).catch(()=>{});
@@ -466,21 +467,38 @@ export default function BarneyApp() {
   });
 
   const subscribePush = async () => {
-    if (!swReg) { alert("Service worker not ready — make sure you opened the app from your home screen"); return; }
+    if (!("serviceWorker" in navigator)) {
+      alert("Your browser does not support push notifications. Make sure you have added the app to your home screen and are opening it from there.");
+      return;
+    }
     setPushStatus("requesting");
     try {
+      // Always get the registration fresh — don't rely on state
+      await navigator.serviceWorker.register("/sw.js");
+      const reg = await navigator.serviceWorker.ready;
+
+      // Request permission
       const perm = await Notification.requestPermission();
       if (perm !== "granted") { setPushStatus("denied"); return; }
-      const sub = await swReg.pushManager.subscribe({
+
+      // Subscribe
+      const sub = await reg.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
       });
+      setSwReg(reg);
       await api.post("/api/push/subscribe", { subscription: sub.toJSON(), deviceName });
       const subs = await api.get("/api/push/subscriptions");
       setPushSubs(Array.isArray(subs)?subs:[]);
       setPushStatus("granted");
       showSaved();
-    } catch(e) { console.error(e); setPushStatus("idle"); alert("Failed to enable notifications: " + e.message); }
+    } catch(e) {
+      console.error("Push subscribe error:", e);
+      setPushStatus("idle");
+      alert("Could not enable notifications: " + e.message + "
+
+Make sure you opened the app from your home screen icon, not Safari.");
+    }
   };
 
   const testPush = () => s(async () => {
