@@ -1,4 +1,5 @@
-/ Barney Tracker — Cloudflare Worker API
+
+// Barney Tracker — Cloudflare Worker API
  
 const CORS = {
   "Access-Control-Allow-Origin": "*",
