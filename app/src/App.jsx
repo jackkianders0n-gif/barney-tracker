@@ -353,7 +353,7 @@ export default function BarneyApp() {
     // Handle OAuth redirect back
     const params = new URLSearchParams(window.location.search);
     if (params.get("auth") === "success") { setCalConnected(true); window.history.replaceState({}, "", window.location.pathname); }
-    // Register service worker and wait until ready
+    // Register service worker
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js")
         .then(() => navigator.serviceWorker.ready)
@@ -473,9 +473,13 @@ export default function BarneyApp() {
     }
     setPushStatus("requesting");
     try {
-      // Always get the registration fresh — don't rely on state
-      await navigator.serviceWorker.register("/sw.js");
-      const reg = await navigator.serviceWorker.ready;
+      // Get existing registration or re-register from file
+      let reg = swReg;
+      if (!reg) {
+        await navigator.serviceWorker.register("/sw.js");
+        reg = await navigator.serviceWorker.ready;
+        setSwReg(reg);
+      }
 
       // Request permission
       const perm = await Notification.requestPermission();
