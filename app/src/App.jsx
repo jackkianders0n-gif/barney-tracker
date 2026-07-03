@@ -499,9 +499,7 @@ export default function BarneyApp() {
     } catch(e) {
       console.error("Push subscribe error:", e);
       setPushStatus("idle");
-      alert("Could not enable notifications: " + e.message + "
-
-Make sure you opened the app from your home screen icon, not Safari.");
+      alert("Could not enable notifications: " + e.message + "\n\nMake sure you opened the app from your home screen icon, not Safari.");
     }
   };
 
