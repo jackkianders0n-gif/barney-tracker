@@ -38,7 +38,7 @@ const MOODS = [
 const VAPID_PUBLIC_KEY = "BDL-4Qg2xdz5eWGweQaOm9mtrLP6-uxnr5S-eJ7e0TW9au_jHzQwOfnloaPRabQhr7GLQaWBkIYJvRvVEgVgeMY";
 
 const NAV = [
-  { id:"home",          label:"Home",          icon:"🏠" },
+  { id:"home",          label:"Dashboard",     icon:"🏠" },
   { id:"calendar",      label:"Calendar",      icon:"📅" },
   { id:"feed",          label:"Feeding",       icon:"🍽️" },
   { id:"toilet",        label:"Toilet",        icon:"🌿" },
@@ -537,6 +537,8 @@ export default function BarneyApp() {
   const latestWeight  = weight.length>0?weight[weight.length-1]:null;
   const todayWalks    = walks.filter(w=>w.created_at?.slice(0,10)===today);
   const todayWalkMins = todayWalks.reduce((s,w)=>s+(w.duration_mins||0),0);
+  const todayHasDaycare = todayWalks.some(w=>w.distance==="daycare");
+  const todayActivity = todayWalkMins > 0 || todayHasDaycare;
   const upcomingVet   = vetAppts.filter(a=>a.upcoming&&a.appt_date>=today).sort((a,b)=>a.appt_date.localeCompare(b.appt_date));
   const daysWithEvents = new Set(gCalEvents.map(e=>e.start?.date||e.start?.dateTime?.slice(0,10)));
   const selectedDayEvents = gCalEvents.filter(e=>(e.start?.date||e.start?.dateTime?.slice(0,10))===selectedDay).sort((a,b)=>(a.start?.dateTime||"").localeCompare(b.start?.dateTime||""));
@@ -557,7 +559,7 @@ export default function BarneyApp() {
 
   // Walk urgency — hours since last walk
   const lastWalkHours = walks.length>0 ? hoursSince(walks[0].created_at) : null;
-  const walkUrgent = lastWalkHours !== null && lastWalkHours > 8;
+  const walkUrgent = !todayActivity && lastWalkHours !== null && lastWalkHours > 4;
 
   // Food urgency
   const foodUrgent = food.pouches === 0;
@@ -651,7 +653,7 @@ export default function BarneyApp() {
               <StatCard icon="🍽️" label="Last fed" value={lastFeed?formatTime(lastFeed.created_at):"Not logged"} sub={lastFeed?.amount} onClick={()=>setTab("feed")} />
               <StatCard icon="💧" label="Last wee"  value={lastWee?formatTime(lastWee.created_at):"Not logged"} onClick={()=>setTab("toilet")} />
               <StatCard icon="🥫" label="Food stock" value={foodUrgent?"⚠️ OUT OF FOOD":`${food.pouches} pouches`} sub={!foodUrgent&&food.pouches<=food.alert_at?"Running low":null} subColor="#ef4444" onClick={()=>setTab("feed")} urgent={foodUrgent} />
-              <StatCard icon="🦮" label="Walked today" value={todayWalkMins>0?`${todayWalkMins} mins`:"Not yet"} sub={!todayWalkMins&&lastWalkHours!==null?`Last walk ${lastWalkHours}h ago`:null} subColor={walkUrgent?"#ef4444":"#94a3b8"} onClick={()=>setTab("walks")} urgent={walkUrgent&&!todayWalkMins} />
+              <StatCard icon="🦮" label="Walked today" value={todayHasDaycare&&!todayWalkMins?"At daycare 🐾":todayWalkMins>0?`${todayWalkMins} mins`:walkUrgent?"⚠️ Not yet":"Not yet"} sub={!todayActivity&&lastWalkHours!==null?`Last walk ${lastWalkHours}h ago`:todayHasDaycare&&todayWalkMins>0?`+ daycare day`:null} subColor={walkUrgent?"#ef4444":"#94a3b8"} onClick={()=>setTab("walks")} urgent={walkUrgent&&!todayActivity} />
             </div>
 
             {/* Treatment countdown */}
@@ -1055,14 +1057,15 @@ export default function BarneyApp() {
               <div style={{ fontSize:13, fontWeight:700, color:"#1e293b", marginBottom:4 }}>What you'll be notified about</div>
               <div style={{ fontSize:12, color:"#94a3b8", marginBottom:12 }}>Notifications fire automatically — no settings needed</div>
               {[
-                { icon:"🍽️", title:"Barney has been fed",     desc:"Every time a meal is logged" },
-                { icon:"💧", title:"Toilet trips",             desc:"Every wee and poo logged" },
-                { icon:"🦮", title:"Walk logged",              desc:"Every walk or daycare day" },
-                { icon:"🥫", title:"Food running low",         desc:"When stock drops below your alert level" },
-                { icon:"🐛", title:"Flea treatment due",       desc:"When 28 days have passed" },
-                { icon:"🪱", title:"Worming due",              desc:"When 90 days have passed" },
-                { icon:"🍽️", title:"Not fed in 6 hours",      desc:"Checked automatically" },
-                { icon:"🦮", title:"Not walked in 8 hours",   desc:"Checked automatically" },
+                { icon:"🍽️", title:"Barney has been fed",        desc:"Every time a meal is logged" },
+                { icon:"💧", title:"Toilet trips",                desc:"Every wee and poo logged" },
+                { icon:"🦮", title:"Walk logged",                 desc:"Every walk or daycare day" },
+                { icon:"🥫", title:"Food running low",            desc:"When stock drops below your alert level" },
+                { icon:"🐛", title:"Flea treatment due",          desc:"When 28 days have passed" },
+                { icon:"🪱", title:"Worming due",                 desc:"When 90 days have passed" },
+                { icon:"🍽️", title:"No breakfast by midday",     desc:"If no meals logged before 12pm" },
+                { icon:"🍽️", title:"No evening meal by 6pm",     desc:"If fewer than 2 meals logged by 6pm" },
+                { icon:"🦮", title:"Not walked by 4pm",           desc:"If no walk or daycare logged by 4pm" },
               ].map((n,i)=>(
                 <div key={i} style={{ display:"flex", gap:12, padding:"8px 0", borderBottom:"1px solid #f1f5f9" }}>
                   <span style={{ fontSize:18, flexShrink:0 }}>{n.icon}</span>
