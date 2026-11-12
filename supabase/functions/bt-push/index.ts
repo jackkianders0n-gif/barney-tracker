@@ -184,17 +184,16 @@ async function runReminders(admin: Admin, forceHour: number | null) {
   const messages: Message[] = [];
 
   if (hour === 8) {
-    // Food left is estimated from the meals logged since the last shop or count
+    // Kibble left is estimated from the meals logged since the last bag or check
     const { data: food } = await admin.rpc("bt_food_status");
     if (food?.counted_at) {
-      const left = Number(food.left ?? 0);
+      const left = Number(food.left_g ?? 0);
       const days = food.days_left == null ? null : Number(food.days_left);
-      const about = Math.max(1, Math.round(left));
-      if (left <= 0) messages.push({ title: "Time to buy Barney's food", body: "By the meals logged, his pouches have run out.", tag: "food", group: "care" });
+      if (left <= 0) messages.push({ title: "Time to buy Barney's food", body: "By the meals logged, his kibble has run out.", tag: "food", group: "care" });
       else if (days != null && days <= Number(food.alert_days ?? 5)) {
         messages.push({
           title: "Time to buy Barney's food",
-          body: `About ${about} ${about === 1 ? "pouch" : "pouches"} left, roughly ${days} ${days === 1 ? "day" : "days"}.`,
+          body: `About ${weight(left)} of kibble left, roughly ${days} ${days === 1 ? "day" : "days"}.`,
           tag: "food", group: "care",
         });
       }
@@ -268,6 +267,10 @@ function addInterval(date: string, n: number, unit: string): string {
     return new Date(Date.UTC(y, m - 1 + n, Math.min(d, lastDay))).toISOString().slice(0, 10);
   }
   return new Date(Date.UTC(y, m - 1, d + (unit === "weeks" ? n * 7 : n))).toISOString().slice(0, 10);
+}
+// 1.4kg, or 350g under a kilo
+function weight(g: number): string {
+  return g >= 1000 ? `${Math.round(g / 100) / 10}kg` : `${Math.max(10, Math.round(g / 10) * 10)}g`;
 }
 function daysFrom(a: string, b: string): number {
   return Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000);

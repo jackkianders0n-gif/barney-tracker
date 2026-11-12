@@ -308,8 +308,10 @@ function applyOp(state, q) {
     let food = { ...(settings.food || {}) };
     if (a.p_add != null || a.p_set != null) {
       const left = foodStatus({ logs, settings }, new Date(a.p_at)).left;
-      food = { ...food, pouches: Math.max(0, a.p_set != null ? a.p_set : left + a.p_add), counted_at: a.p_at };
+      food = { ...food, grams: Math.round(Math.max(0, a.p_set != null ? a.p_set : left + a.p_add)), counted_at: a.p_at };
     }
+    if (a.p_meal_g != null) food.meal_g = a.p_meal_g;
+    if (a.p_bag_g != null) food.bag_g = a.p_bag_g;
     if (a.p_alert_days != null) food.alert_days = a.p_alert_days;
     settings = { ...settings, food };
   }
@@ -533,29 +535,33 @@ function useBarney(userId) {
 // ---------------------------------------------------------------------------
 const latestOf = (logs, kinds) => logs.find((l) => kinds.includes(l.kind)) || null;
 
-// Food left: the pouches counted at counted_at, less the meals logged since
-// (full portion = 1 pouch, half = ½, treat only = 0). The same sums as
+// Kibble left: the grams there were at counted_at, less the meals logged since
+// (full portion = meal_g, half = half that, treat only = 0). The same sums as
 // bt_food_status() in schema.sql, which bt-push and bt-alexa use.
-const POUCHES_PER = { half: 0.5, treat: 0 };
-const pouchesIn = (l) => { const p = l.details && l.details.portion; return p in POUCHES_PER ? POUCHES_PER[p] : 1; };
+const PORTION_SHARE = { half: 0.5, treat: 0 };
+const shareOf = (l) => { const p = l.details && l.details.portion; return p in PORTION_SHARE ? PORTION_SHARE[p] : 1; };
 function foodStatus(data, at = new Date()) {
   const f = (data.settings && data.settings.food) || {};
+  const mealG = Number(f.meal_g) || 90;
+  const bagG = Number(f.bag_g) || 2000;
+  const alertDays = f.alert_days != null ? Number(f.alert_days) : 5;
   const known = !!f.counted_at;
   const fed = data.logs.filter((l) => l.kind === "fed" && new Date(l.at) <= at);
   const since = known ? new Date(f.counted_at) : null;
-  const used = known ? fed.filter((l) => new Date(l.at) > since).reduce((n, l) => n + pouchesIn(l), 0) : 0;
-  const left = Math.max(0, (Number(f.pouches) || 0) - used);
-  // Pouches a day over the last fortnight, or 2 until there's enough to go on
+  const used = known ? fed.filter((l) => new Date(l.at) > since).reduce((n, l) => n + shareOf(l), 0) * mealG : 0;
+  const left = Math.max(0, (Number(f.grams) || 0) - used);
+  // Grams a day over the last fortnight, or two meals a day until there's enough to go on
   const recent = fed.filter((l) => new Date(l.at) > addDays(at, -14));
-  let perDay = 2;
+  let perDay = 2 * mealG;
   if (recent.length >= 4) {
     const first = Math.min(...recent.map((l) => new Date(l.at).getTime()));
-    perDay = recent.reduce((n, l) => n + pouchesIn(l), 0) / Math.max(1, Math.min(14, (at - first) / 86400000));
+    perDay = (recent.reduce((n, l) => n + shareOf(l), 0) * mealG) / Math.max(1, Math.min(14, (at - first) / 86400000));
   }
   const daysLeft = perDay > 0 ? Math.floor(left / perDay) : null;
-  const alertDays = f.alert_days != null ? Number(f.alert_days) : 5;
-  return { known, left, perDay, daysLeft, alertDays, low: known && (left <= 0 || (daysLeft != null && daysLeft <= alertDays)) };
+  return { known, left, perDay, daysLeft, mealG, bagG, alertDays, low: known && (left <= 0 || (daysLeft != null && daysLeft <= alertDays)) };
 }
+// 1.4kg, or 350g under a kilo
+const weight = (g) => (g >= 1000 ? `${Math.round(g / 100) / 10}kg` : `${Math.max(10, Math.round(g / 10) * 10)}g`);
 const whoOf = (store, log) => {
   if (log.created_by && store.names[log.created_by]) return store.names[log.created_by];
   const by = log.details && log.details.by;
@@ -783,7 +789,6 @@ function TodayScreen({ store, open, onLogged, photo }) {
   const where = whereNow(store.plans);
   const items = careItems(store);
   const food = foodStatus(store);
-  const about = Math.max(1, Math.round(food.left));
   const daycarePlan = store.plans.some((p) => p.day === today && p.place === "daycare");
 
   const quick = (kind, details = {}) => {
@@ -881,12 +886,12 @@ function TodayScreen({ store, open, onLogged, photo }) {
         <button type="button" className="cupboard-count" onClick={() => open({ type: "food" })}>
           <Icon name="pouch" size={26} />
           <span>
-            <span className="cupboard-num">{!food.known ? "Food cupboard" : food.left <= 0 ? "Out of food" : food.low ? "Buy food soon" : `About ${plural(about, "pouch", "pouches")}`}</span>
+            <span className="cupboard-num">{!food.known ? "His kibble" : food.left <= 0 ? "Out of kibble" : food.low ? "Buy food soon" : `About ${weight(food.left)} left`}</span>
             <span className="cupboard-sub">
-              {!food.known ? "Tap Bought food next shop"
+              {!food.known ? "Tap to say how full the bag is"
                 : food.left <= 0 ? "By the meals logged"
-                : food.low ? `About ${about} left, ${plural(food.daysLeft, "day")}`
-                : `Roughly ${plural(food.daysLeft, "day")} left`}
+                : food.low ? `About ${weight(food.left)}, ${plural(food.daysLeft, "day")}`
+                : `Roughly ${plural(food.daysLeft, "day")} of food`}
             </span>
           </span>
         </button>
@@ -1434,8 +1439,8 @@ function BarneyScreen({ store, open, photo, sub, session }) {
         <h2>Settings</h2>
         <ul className="list settings">
           <li className="setting">
-            <span className="log-main"><span className="log-title">Food cupboard</span><span className="log-sub">Reminds you to buy more with about {plural(foodStatus(store).alertDays, "day")} left</span></span>
-            <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "food" })}>Change</button>
+            <span className="log-main"><span className="log-title">Food</span><span className="log-sub">{(() => { const f = foodStatus(store); return `${f.mealG}g a meal, ${weight(f.bagG)} bags. Reminds you with ${plural(f.alertDays, "day")} left`; })()}</span></span>
+            <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "food", settings: true })}>Change</button>
           </li>
           <li className="setting">
             <span className="log-main">
@@ -1586,14 +1591,14 @@ async function importFromOldApp(onStep) {
   await upsert("bt_plans", plans, "plans");
   await upsert("bt_appointments", appts, "appointments");
 
-  await step("his details and the food cupboard", async () => {
-    const [info, food] = await Promise.all([get("/api/info"), get("/api/food")]);
+  await step("his details", async () => {
+    const info = await get("/api/info");
     const { data: current } = await sb.from("bt_settings").select("key, value").in("key", ["info"]);
     const now = (current && current[0] && current[0].value) || {};
     const merged = { ...now };
     for (const f of [...INFO_FIELDS.map((x) => x.key), "notes"]) if (!merged[f] && info && info[f]) merged[f] = info[f];
     await sb.from("bt_settings").upsert({ key: "info", value: merged });
-    if (food && food.pouches != null) await sb.rpc("bt_food_update", { p_set: Number(food.pouches) });
+    // The old app counted pouches; Barney's on kibble now, so that count isn't brought over
   });
   await sb.from("bt_settings").upsert({ key: "imported_at", value: new Date().toISOString() });
 
@@ -1995,55 +2000,93 @@ function TreatmentSheet({ store, kind, onClose }) {
   );
 }
 
-const BOXES = [12, 24, 48];
-function FoodSheet({ store, buy, onClose }) {
+// How full the bag looks, for correcting the estimate without scales
+const BAG_FILL = [
+  { share: 1, label: "Full" },
+  { share: 0.75, label: "Three-quarters" },
+  { share: 0.5, label: "Half" },
+  { share: 0.25, label: "A quarter" },
+  { share: 0.1, label: "Nearly empty" },
+];
+function FoodSheet({ store, buy, settings, onClose }) {
   const food = foodStatus(store);
-  const [mode, setMode] = useState(buy || !food.known ? "buy" : "count");
-  const [bought, setBought] = useState("");
-  const [count, setCount] = useState(String(Math.round(food.left)));
-  const [alertDays, setAlertDays] = useState(food.alertDays);
-  const add = (n) => {
-    store.food({ p_add: n });
-    toast(`${plural(n, "pouch", "pouches")} added`);
+  const [mode, setMode] = useState(buy ? "buy" : settings ? "settings" : "check");
+  const [kg, setKg] = useState("");
+  const [fill, setFill] = useState(null);
+  const [spare, setSpare] = useState(0);
+  const [mealG, setMealG] = useState(String(food.mealG));
+  const [bagKg, setBagKg] = useState(String(food.bagG / 1000));
+  const [alertDays, setAlertDays] = useState(String(food.alertDays));
+
+  const add = (g) => {
+    store.food({ p_add: g });
+    toast(`${weight(g)} added`);
     onClose();
   };
-  const saveCount = (e) => {
+  const check = () => {
+    store.food({ p_set: Math.round((fill + spare) * food.bagG) });
+    toast("Food updated");
+    onClose();
+  };
+  const saveSettings = (e) => {
     e.preventDefault();
-    const n = Math.max(0, Math.round(Number(count) || 0));
-    store.food({ p_set: n, p_alert_days: Math.max(0, Number(alertDays) || 0) });
-    toast("Food cupboard updated");
+    const m = Math.round(Number(mealG)), b = Math.round(Number(bagKg) * 1000), d = Math.round(Number(alertDays));
+    if (!(m > 0) || !(b > 0) || !(d >= 0)) { toast("Check the numbers", "error"); return; }
+    store.food({ p_meal_g: m, p_bag_g: b, p_alert_days: d });
+    toast("Food settings saved");
     onClose();
   };
+
   return (
-    <Sheet title={mode === "buy" ? "Bought food" : "Food cupboard"} onClose={onClose}>
-      {mode === "buy" ? (
-        <form className="sheet-body" onSubmit={(e) => { e.preventDefault(); const n = Math.round(Number(bought)); if (n > 0) add(n); }}>
-          <p className="block-note">{food.known && food.left > 0 ? `Added to the ${plural(Math.round(food.left), "pouch", "pouches")} already there.` : "How many pouches did you buy?"}</p>
+    <Sheet title={mode === "buy" ? "Bought food" : mode === "settings" ? "Food settings" : "How full is his bag?"} onClose={onClose}>
+      {mode === "buy" && (
+        <form className="sheet-body" onSubmit={(e) => { e.preventDefault(); const g = Math.round(Number(kg) * 1000); if (g > 0) add(g); }}>
+          <p className="block-note">{food.known && food.left > 0 ? `Added to the ${weight(food.left)} he's got.` : "How much did you buy?"}</p>
           <div className="minutes">
-            {BOXES.map((n) => (
-              <button key={n} type="button" className="minute" onClick={() => add(n)}><b>{n}</b><span>pouches</span></button>
+            {[1, 2, 3].map((n) => (
+              <button key={n} type="button" className="minute" onClick={() => add(n * food.bagG)}>
+                <b>{n}</b><span>{n === 1 ? "bag" : "bags"}, {weight(n * food.bagG)}</span>
+              </button>
             ))}
           </div>
-          <Field label="Or how many" id="bought">
-            <input id="bought" className="input input-short" type="number" inputMode="numeric" min="1" value={bought} onChange={(e) => setBought(e.target.value)} />
+          <Field label="Or how many kg" id="bought-kg">
+            <input id="bought-kg" className="input input-short" type="number" inputMode="decimal" step="0.1" min="0" value={kg} onChange={(e) => setKg(e.target.value)} />
           </Field>
-          <button type="submit" className="btn btn-primary btn-block" disabled={!(Number(bought) > 0)}>Add to the cupboard</button>
-          <button type="button" className="link-more" onClick={() => setMode("count")}>Count what's there instead</button>
+          <button type="submit" className="btn btn-primary btn-block" disabled={!(Number(kg) > 0)}>Add</button>
+          <button type="button" className="link-more" onClick={() => setMode("check")}>Say how full the bag is instead</button>
         </form>
-      ) : (
-        <form className="sheet-body" onSubmit={saveCount}>
+      )}
+      {mode === "check" && (
+        <div className="sheet-body">
           <p className="block-note">
-            {food.known ? `Worked out from the meals logged: about ${plural(Math.round(food.left), "pouch", "pouches")}, going at ${Math.round(food.perDay * 10) / 10} a day.` : "Not counted yet."}
-            {" "}If it's wrong, put the real number in.
+            {food.known
+              ? `Going by the meals logged, there's about ${weight(food.left)} left (${food.mealG}g a meal). If that looks wrong, pick how full the open bag is.`
+              : "Pick how full the open bag is, and the app works out the rest from the meals logged."}
           </p>
-          <Field label="Pouches in the cupboard now" id="pouches">
-            <input id="pouches" className="input input-short" type="number" inputMode="numeric" min="0" value={count} onChange={(e) => setCount(e.target.value)} />
+          <Choices label="The open bag" options={BAG_FILL.map((b) => ({ key: b.share, label: b.label }))} value={fill} onChange={setFill} />
+          <Choices label="Unopened bags as well" options={[0, 1, 2, 3].map((n) => ({ key: n, label: n === 0 ? "None" : String(n) }))} value={spare} onChange={setSpare} />
+          <button type="button" className="btn btn-primary btn-block" disabled={fill == null} onClick={check}>
+            {fill == null ? "Save" : `Save: about ${weight((fill + spare) * food.bagG)}`}
+          </button>
+          <div className="sheet-links">
+            <button type="button" className="link-more" onClick={() => setMode("buy")}>Bought food</button>
+            <button type="button" className="link-more" onClick={() => setMode("settings")}>Meal size, bag size and reminder</button>
+          </div>
+        </div>
+      )}
+      {mode === "settings" && (
+        <form className="sheet-body" onSubmit={saveSettings}>
+          <Field label="Kibble per meal (g)" id="meal-g">
+            <input id="meal-g" className="input input-short" type="number" inputMode="numeric" min="1" value={mealG} onChange={(e) => setMealG(e.target.value)} />
+          </Field>
+          <Field label="Bag size (kg)" id="bag-kg">
+            <input id="bag-kg" className="input input-short" type="number" inputMode="decimal" step="0.1" min="0.1" value={bagKg} onChange={(e) => setBagKg(e.target.value)} />
           </Field>
           <Field label="Remind me to buy more with this many days left" id="alert-days">
             <input id="alert-days" className="input input-short" type="number" inputMode="numeric" min="0" value={alertDays} onChange={(e) => setAlertDays(e.target.value)} />
           </Field>
+          <p className="field-hint">Half portions count as half a meal, and treats as none.</p>
           <button type="submit" className="btn btn-primary btn-block">Save</button>
-          <button type="button" className="link-more" onClick={() => setMode("buy")}>Bought food</button>
         </form>
       )}
     </Sheet>
@@ -2230,7 +2273,7 @@ function Main({ session }) {
         sheetEl = <InfoSheet store={store} onClose={close} />;
         break;
       case "food":
-        sheetEl = <FoodSheet store={store} buy={sheet.buy} onClose={close} />;
+        sheetEl = <FoodSheet store={store} buy={sheet.buy} settings={sheet.settings} onClose={close} />;
         break;
       case "treatment":
         sheetEl = <TreatmentSheet store={store} kind={sheet.kind} onClose={close} />;

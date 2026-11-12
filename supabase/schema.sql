@@ -220,10 +220,11 @@ begin
   end if;
 end $$;
 
--- Food cupboard: { pouches, counted_at, alert_days }. pouches is how many there
--- were at counted_at; what's left now is that minus the meals logged since
--- (full portion = 1 pouch, half = ½, treat only = 0). The app works it out the
--- same way (foodStatus in app.jsx); bt-push and bt-alexa call this.
+-- Food: Barney's kibble, in grams. { grams, counted_at, meal_g, bag_g, alert_days }:
+-- grams is how much there was at counted_at; what's left now is that minus the
+-- meals logged since (full portion = meal_g, half = half that, treat only = 0).
+-- The app works it out the same way (foodStatus in app.jsx); bt-push and
+-- bt-alexa call this.
 create or replace function public.bt_food_status(p_at timestamptz default now())
 returns jsonb
 language sql
@@ -232,42 +233,45 @@ security invoker
 set search_path = public
 as $$
   with f as (
-    select value from public.bt_settings where key = 'food'
+    select value, coalesce((value->>'meal_g')::numeric, 90) as meal_g from public.bt_settings where key = 'food'
   ), used as (
-    select coalesce(sum(case l.details->>'portion' when 'half' then 0.5 when 'treat' then 0 else 1 end), 0) as n
-      from public.bt_log l, f
-     where l.kind = 'fed' and l.at > (f.value->>'counted_at')::timestamptz and l.at <= p_at
-  ), recent as (  -- pouches a day over the last fortnight (2 a day until there's enough to go on)
+    select f.meal_g * coalesce((
+             select sum(case l.details->>'portion' when 'half' then 0.5 when 'treat' then 0 else 1 end)
+               from public.bt_log l
+              where l.kind = 'fed' and l.at > (f.value->>'counted_at')::timestamptz and l.at <= p_at), 0) as g
+      from f
+  ), recent as (  -- grams a day over the last fortnight (two meals a day until there's enough to go on)
     select count(*) as meals,
-           coalesce(sum(case l.details->>'portion' when 'half' then 0.5 when 'treat' then 0 else 1 end), 0) as n,
+           coalesce(sum(case l.details->>'portion' when 'half' then 0.5 when 'treat' then 0 else 1 end), 0) as portions,
            min(l.at) as first_at
       from public.bt_log l
      where l.kind = 'fed' and l.at > p_at - interval '14 days' and l.at <= p_at
-  ), rate as (
-    select case when meals >= 4
-                then n / greatest(1, least(14, extract(epoch from p_at - first_at) / 86400))
-                else 2 end as per_day
-      from recent
   ), calc as (
-    select greatest(0, coalesce((f.value->>'pouches')::numeric, 0) - used.n) as left_now, rate.per_day,
-           coalesce((f.value->>'alert_days')::int, 5) as alert_days, f.value->>'counted_at' as counted_at
-      from f, used, rate
+    select greatest(0, coalesce((f.value->>'grams')::numeric, 0) - used.g) as left_g,
+           f.meal_g * case when recent.meals >= 4
+                           then recent.portions / greatest(1, least(14, extract(epoch from p_at - recent.first_at) / 86400))
+                           else 2 end as per_day_g,
+           f.value
+      from f, used, recent
   )
   select jsonb_build_object(
-           'left', round(left_now, 1),
-           'per_day', round(per_day, 2),
-           'days_left', case when per_day > 0 then floor(left_now / per_day) end,
-           'alert_days', alert_days,
-           'counted_at', counted_at)
+           'left_g', round(left_g),
+           'per_day_g', round(per_day_g),
+           'days_left', case when per_day_g > 0 then floor(left_g / per_day_g) end,
+           'alert_days', coalesce((value->>'alert_days')::int, 5),
+           'counted_at', value->>'counted_at')
     from calc;
 $$;
 grant execute on function public.bt_food_status(timestamptz) to authenticated;
 
--- Bought food (p_add), counted what's there (p_set) or changed when to warn
--- (p_alert_days). p_at is when it happened on the phone, so a change sent
--- later from the outbox still lines up with the meals around it.
+-- Bought food (p_add grams), said how full the bag is (p_set grams), or changed
+-- the settings. p_at is when it happened on the phone, so a change sent later
+-- from the outbox still lines up with the meals around it.
 drop function if exists public.bt_food_update(integer, integer, integer);
-create or replace function public.bt_food_update(p_add numeric default null, p_set numeric default null, p_alert_days integer default null, p_at timestamptz default now())
+drop function if exists public.bt_food_update(numeric, numeric, integer, timestamptz);
+create or replace function public.bt_food_update(
+  p_add numeric default null, p_set numeric default null, p_at timestamptz default now(),
+  p_meal_g integer default null, p_bag_g integer default null, p_alert_days integer default null)
 returns jsonb
 language plpgsql
 security invoker
@@ -275,37 +279,41 @@ set search_path = public
 as $$
 declare
   v jsonb;
-  left_now numeric;
+  left_g numeric;
 begin
-  insert into public.bt_settings (key, value) values ('food', jsonb_build_object('pouches', 0, 'counted_at', now(), 'alert_days', 5))
+  insert into public.bt_settings (key, value) values ('food', '{"meal_g":90,"bag_g":2000,"alert_days":5}'::jsonb)
   on conflict (key) do nothing;
   if p_add is not null or p_set is not null then
-    left_now := coalesce((public.bt_food_status(p_at)->>'left')::numeric, 0);
+    left_g := coalesce((public.bt_food_status(p_at)->>'left_g')::numeric, 0);
     update public.bt_settings
-       set value = value || jsonb_build_object('pouches', greatest(0, coalesce(p_set, left_now + p_add)), 'counted_at', p_at)
+       set value = value || jsonb_build_object('grams', round(greatest(0, coalesce(p_set, left_g + p_add))), 'counted_at', p_at)
      where key = 'food';
   end if;
-  if p_alert_days is not null then
-    update public.bt_settings set value = value || jsonb_build_object('alert_days', greatest(0, p_alert_days)) where key = 'food';
-  end if;
+  update public.bt_settings
+     set value = value || jsonb_strip_nulls(jsonb_build_object(  -- only the ones given
+           'meal_g', case when p_meal_g is not null then greatest(1, p_meal_g) end,
+           'bag_g', case when p_bag_g is not null then greatest(1, p_bag_g) end,
+           'alert_days', case when p_alert_days is not null then greatest(0, p_alert_days) end))
+   where key = 'food';
   select value into v from public.bt_settings where key = 'food';
   return v;
 end;
 $$;
-grant execute on function public.bt_food_update(numeric, numeric, integer, timestamptz) to authenticated;
+grant execute on function public.bt_food_update(numeric, numeric, timestamptz, integer, integer, integer) to authenticated;
 
 
 -- Starting values and private keys
 insert into public.bt_settings (key, value) values
-  ('food', jsonb_build_object('pouches', 0, 'counted_at', now(), 'alert_days', 5)),
+  ('food', '{"meal_g":90,"bag_g":2000,"alert_days":5}'::jsonb),
   ('info', '{}'::jsonb),
   ('alexa_key', to_jsonb(replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '')))
 on conflict (key) do nothing;
 
--- From the old pouch counter: start counting meals from now
+-- From the old pouch counter: switch to kibble. How much is left isn't known
+-- until someone taps Bought food or says how full the bag is.
 update public.bt_settings
-   set value = (value - 'alert_at') || jsonb_build_object('counted_at', now(), 'alert_days', 5)
- where key = 'food' and not value ? 'counted_at';
+   set value = jsonb_build_object('meal_g', 90, 'bag_g', 2000, 'alert_days', coalesce((value->>'alert_days')::int, 5))
+ where key = 'food' and not value ? 'meal_g';
 
 insert into public.bt_secrets (key, value) values
   ('fn_key', to_jsonb(replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '')))

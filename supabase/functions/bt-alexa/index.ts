@@ -71,10 +71,16 @@ Deno.serve(async (req: Request) => {
     lastFeed,
     lastWee: toilet(wee.data),
     lastPoo: toilet(poo.data),
-    // Estimated from meals logged since the last shop, in the old { pouches, alert_at } shape
+    // Kibble left, estimated from meals logged since the last bag or check.
+    // The old { pouches, alert_at } keys are kept for the skill, as days of food left.
     food: food.data?.counted_at
-      ? { pouches: Math.round(Number(food.data.left ?? 0)), alert_at: Math.round(Number(food.data.alert_days ?? 5) * Number(food.data.per_day ?? 2)) }
-      : { pouches: 0, alert_at: 5 },
+      ? {
+          kibble_g: Number(food.data.left_g ?? 0),
+          days_left: food.data.days_left,
+          pouches: Number(food.data.days_left ?? 0),
+          alert_at: Number(food.data.alert_days ?? 5),
+        }
+      : { kibble_g: null, days_left: null, pouches: 0, alert_at: 5 },
     todayWalkMins: (walks.data ?? []).reduce((n: number, w: any) => n + (Number(w.details?.mins) || 0), 0),
     nextVet: vet.data ? {
       id: vet.data.id,
