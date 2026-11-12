@@ -82,6 +82,17 @@ const EATEN = [
 const WALK_MINS = [15, 20, 30, 45, 60, 90];
 const BEHAVIOURS = ["Limping", "Not eating", "Scratching", "Vomiting", "Lethargy", "Unusual behaviour", "Other"];
 const GROOMING_TYPES = ["Bath", "Brush", "Nail clip", "Ear clean", "Other"];
+// What each phone can choose to hear about (bt_push_subscriptions.notify; null = all)
+const NOTIFY_GROUPS = [
+  { key: "fed", label: "Meals", sub: "When someone else feeds him" },
+  { key: "water", label: "Water" },
+  { key: "toilet", label: "Wees and poos" },
+  { key: "walk", label: "Walks and daycare" },
+  { key: "nudges", label: "Meal and walk reminders", sub: "12pm, 4pm and 6pm, if nothing's logged" },
+  { key: "care", label: "Treatments, food and appointments", sub: "8am, when something's due" },
+];
+const ALL_NOTIFY = NOTIFY_GROUPS.map((g) => g.key);
+
 const INFO_FIELDS = [
   { key: "microchip", label: "Microchip number" },
   { key: "vet", label: "Vet practice" },
@@ -292,16 +303,15 @@ function applyOp(state, q) {
   if (q.op === "insert") logs = [...logs.filter((l) => l.id !== q.row.id), q.row];
   if (q.op === "update") logs = logs.map((l) => (l.id === q.id ? { ...l, ...q.patch } : l));
   if (q.op === "delete") logs = logs.filter((l) => l.id !== q.id);
-  if (q.op === "food") {
-    const f = settings.food || { pouches: 0, alert_at: 5 };
+  if (q.op === "food2") {
     const a = q.args;
-    settings = {
-      ...settings,
-      food: {
-        pouches: Math.max(0, a.p_pouches != null ? a.p_pouches : (Number(f.pouches) || 0) + (a.p_delta || 0)),
-        alert_at: a.p_alert_at != null ? a.p_alert_at : f.alert_at,
-      },
-    };
+    let food = { ...(settings.food || {}) };
+    if (a.p_add != null || a.p_set != null) {
+      const left = foodStatus({ logs, settings }, new Date(a.p_at)).left;
+      food = { ...food, pouches: Math.max(0, a.p_set != null ? a.p_set : left + a.p_add), counted_at: a.p_at };
+    }
+    if (a.p_alert_days != null) food.alert_days = a.p_alert_days;
+    settings = { ...settings, food };
   }
   return { ...state, logs: logs === state.logs ? logs : [...logs].sort(byAtDesc), settings };
 }
@@ -314,7 +324,8 @@ async function runOp(q) {
     }
     case "update": return sb.from("bt_log").update(q.patch).eq("id", q.id);
     case "delete": return sb.from("bt_log").delete().eq("id", q.id);
-    case "food": return sb.rpc("bt_food_update", q.args);
+    case "food2": return sb.rpc("bt_food_update", q.args);
+    // "food" (the old pouch counter) is dropped: the database no longer takes it
     default: return { error: null };
   }
 }
@@ -344,7 +355,7 @@ function useBarney(userId) {
         sb.from("bt_plans").select("*").gte("day", dayKey(addDays(new Date(), -28))).order("day"),
         sb.from("bt_appointments").select("*").order("day"),
         sb.from("bt_settings").select("key, value"),
-        sb.from("bt_push_subscriptions").select("id, endpoint, device_name, user_id, created_at").order("created_at"),
+        sb.from("bt_push_subscriptions").select("id, endpoint, device_name, user_id, created_at, notify").order("created_at"),
         sb.rpc("bt_member_names"),
         sb.from("bt_plan_repeats").select("*").order("created_at"),
       ]);
@@ -392,7 +403,7 @@ function useBarney(userId) {
           toast("A change couldn't be saved", "error");
         } else {
           setBase((b) => {
-            if (entry.op === "food" && res.data) return { ...b, settings: { ...b.settings, food: res.data } };
+            if (entry.op === "food2" && res.data) return { ...b, settings: { ...b.settings, food: res.data } };
             return applyOp(b, entry);
           });
           sent = true;
@@ -498,7 +509,11 @@ function useBarney(userId) {
     addLog,
     updateLog: (id, patch) => commit({ op: "update", id, patch }),
     deleteLog: (id) => commit({ op: "delete", id }),
-    food: (args) => commit({ op: "food", args }),
+    food: (args) => commit({ op: "food2", args: { p_at: new Date().toISOString(), ...args } }),
+    setNotify: (id, notify) => {
+      setBase((b) => ({ ...b, subs: b.subs.map((x) => (x.id === id ? { ...x, notify } : x)) }));
+      return online(() => sb.from("bt_push_subscriptions").update({ notify }).eq("id", id));
+    },
     savePlan: (id, row) => online(() => (id ? sb.from("bt_plans").update(row).eq("id", id) : sb.from("bt_plans").insert(row)), "Plan saved"),
     deletePlan: (id) => online(() => sb.from("bt_plans").delete().eq("id", id), "Plan removed"),
     saveRepeat: (id, row) => online(() => (id ? sb.from("bt_plan_repeats").update(row).eq("id", id) : sb.from("bt_plan_repeats").insert(row)), "Weekly plan saved"),
@@ -517,6 +532,30 @@ function useBarney(userId) {
 // Working things out from the data
 // ---------------------------------------------------------------------------
 const latestOf = (logs, kinds) => logs.find((l) => kinds.includes(l.kind)) || null;
+
+// Food left: the pouches counted at counted_at, less the meals logged since
+// (full portion = 1 pouch, half = ½, treat only = 0). The same sums as
+// bt_food_status() in schema.sql, which bt-push and bt-alexa use.
+const POUCHES_PER = { half: 0.5, treat: 0 };
+const pouchesIn = (l) => { const p = l.details && l.details.portion; return p in POUCHES_PER ? POUCHES_PER[p] : 1; };
+function foodStatus(data, at = new Date()) {
+  const f = (data.settings && data.settings.food) || {};
+  const known = !!f.counted_at;
+  const fed = data.logs.filter((l) => l.kind === "fed" && new Date(l.at) <= at);
+  const since = known ? new Date(f.counted_at) : null;
+  const used = known ? fed.filter((l) => new Date(l.at) > since).reduce((n, l) => n + pouchesIn(l), 0) : 0;
+  const left = Math.max(0, (Number(f.pouches) || 0) - used);
+  // Pouches a day over the last fortnight, or 2 until there's enough to go on
+  const recent = fed.filter((l) => new Date(l.at) > addDays(at, -14));
+  let perDay = 2;
+  if (recent.length >= 4) {
+    const first = Math.min(...recent.map((l) => new Date(l.at).getTime()));
+    perDay = recent.reduce((n, l) => n + pouchesIn(l), 0) / Math.max(1, Math.min(14, (at - first) / 86400000));
+  }
+  const daysLeft = perDay > 0 ? Math.floor(left / perDay) : null;
+  const alertDays = f.alert_days != null ? Number(f.alert_days) : 5;
+  return { known, left, perDay, daysLeft, alertDays, low: known && (left <= 0 || (daysLeft != null && daysLeft <= alertDays)) };
+}
 const whoOf = (store, log) => {
   if (log.created_by && store.names[log.created_by]) return store.names[log.created_by];
   const by = log.details && log.details.by;
@@ -743,8 +782,9 @@ function TodayScreen({ store, open, onLogged, photo }) {
   const daycare = todays.some((l) => l.kind === "daycare");
   const where = whereNow(store.plans);
   const items = careItems(store);
-  const food = store.settings.food || { pouches: 0, alert_at: 5 };
-  const pouches = Number(food.pouches) || 0;
+  const food = foodStatus(store);
+  const about = Math.max(1, Math.round(food.left));
+  const daycarePlan = store.plans.some((p) => p.day === today && p.place === "daycare");
 
   const quick = (kind, details = {}) => {
     const row = store.addLog(kind, details);
@@ -760,8 +800,8 @@ function TodayScreen({ store, open, onLogged, photo }) {
   else if (hour >= 12) { fedNote = "No meals yet today"; fedUrgent = true; }
 
   let walkLine, walkUrgent = false;
-  if (daycare && !walkMins) walkLine = "At daycare today";
-  else if (walkMins) walkLine = `${walkMins} minutes today${daycare ? ", plus daycare" : ""}`;
+  if ((daycare || daycarePlan) && !walkMins) walkLine = "At daycare today";
+  else if (walkMins) walkLine = `${walkMins} minutes today${daycare || daycarePlan ? ", plus daycare" : ""}`;
   else if (hour >= 16) { walkLine = "Not walked yet today"; walkUrgent = true; }
   else walkLine = last(["walk", "daycare"]) ? `Last walk ${lowerAgo(last(["walk", "daycare"]).at)}` : "No walks logged yet";
 
@@ -826,7 +866,7 @@ function TodayScreen({ store, open, onLogged, photo }) {
                   {it.sub && <span className="care-sub">{it.sub}</span>}
                 </span>
                 {it.action === "done" && (
-                  <button type="button" className="btn btn-small" onClick={() => { store.addLog(it.kind, {}); toast(`${KIND[it.kind].title} logged for today`); }}>Done</button>
+                  <button type="button" className="btn btn-small" onClick={() => onLogged(store.addLog(it.kind, {}))}>Done</button>
                 )}
                 {it.action === "set" && <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "log", kind: it.kind })}>Add date</button>}
                 {it.action === "call" && <a className="btn btn-small btn-outline" href={`tel:${store.settings.info.vet_phone}`}><Icon name="phone" size={18} /> Call</a>}
@@ -837,18 +877,20 @@ function TodayScreen({ store, open, onLogged, photo }) {
         </section>
       )}
 
-      <section className={`block cupboard ${pouches <= (Number(food.alert_at) || 0) ? "is-low" : ""}`} aria-label="Food cupboard">
+      <section className={`block cupboard ${food.low ? "is-low" : ""}`} aria-label="Food cupboard">
         <button type="button" className="cupboard-count" onClick={() => open({ type: "food" })}>
           <Icon name="pouch" size={26} />
           <span>
-            <span className="cupboard-num">{pouches === 0 ? "Out of food" : plural(pouches, "pouch", "pouches")}</span>
-            <span className="cupboard-sub">{pouches === 0 ? "Time to buy more" : pouches <= (Number(food.alert_at) || 0) ? "Running low" : "In the cupboard"}</span>
+            <span className="cupboard-num">{!food.known ? "Food cupboard" : food.left <= 0 ? "Out of food" : food.low ? "Buy food soon" : `About ${plural(about, "pouch", "pouches")}`}</span>
+            <span className="cupboard-sub">
+              {!food.known ? "Tap Bought food next shop"
+                : food.left <= 0 ? "By the meals logged"
+                : food.low ? `About ${about} left, ${plural(food.daysLeft, "day")}`
+                : `Roughly ${plural(food.daysLeft, "day")} left`}
+            </span>
           </span>
         </button>
-        <div className="stepper">
-          <button type="button" className="step" onClick={() => store.food({ p_delta: -1 })} aria-label="Take one pouch out" disabled={pouches === 0}><Icon name="minus" size={20} /></button>
-          <button type="button" className="step step-add" onClick={() => store.food({ p_delta: 12 })} aria-label="Add a box of 12">+12</button>
-        </div>
+        <button type="button" className="btn btn-small" onClick={() => open({ type: "food", buy: true })}>Bought food</button>
       </section>
 
       <section className="block">
@@ -944,7 +986,7 @@ function HistoryList({ store, logs, open, empty, limit = 5 }) {
   );
 }
 
-function HealthScreen({ store, open }) {
+function HealthScreen({ store, open, onLogged }) {
   useNow();
   const logs = store.logs;
   const weights = logs.filter((l) => l.kind === "weight").sort((a, b) => new Date(a.at) - new Date(b.at))
@@ -981,7 +1023,7 @@ function HealthScreen({ store, open }) {
                 {due && <p className="treatment-next">{`Due ${shortDate(due)}`}{custom && " (date set)"}</p>}
                 <p className="treatment-last">{last ? `Last done ${shortDate(new Date(last.at))}` : "Add when it was last done"}</p>
                 <div className="treatment-actions">
-                  <button type="button" className="btn btn-small" onClick={() => { store.addLog(t.kind, {}); toast(`${t.label} logged for today`); }}>Done today</button>
+                  <button type="button" className="btn btn-small" onClick={() => onLogged(store.addLog(t.kind, {}))}>Done today</button>
                   <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "log", kind: t.kind })}>Other date</button>
                   <button type="button" className="btn btn-small btn-quiet" onClick={() => open({ type: "treatment", kind: t.kind })}><Icon name="calendar" size={18} /> Due date</button>
                 </div>
@@ -1154,7 +1196,13 @@ function Notifications({ store }) {
     navigator.serviceWorker.ready.then((r) => r.pushManager.getSubscription()).then((s) => setEndpoint(s ? s.endpoint : false)).catch(() => setEndpoint(false));
   }, [supported]);
   useEffect(() => { if (!name && store.myName) setName(`${store.myName}'s iPhone`); }, [store.myName]);
-  const on = !!endpoint && store.subs.some((s) => s.endpoint === endpoint);
+  const mine = endpoint ? store.subs.find((s) => s.endpoint === endpoint) : null;
+  const on = !!mine;
+  const chosen = mine && Array.isArray(mine.notify) ? mine.notify : ALL_NOTIFY;
+  const choose = (key, yes) => {
+    const next = ALL_NOTIFY.filter((k) => (k === key ? yes : chosen.includes(k)));
+    store.setNotify(mine.id, next.length === ALL_NOTIFY.length ? null : next);
+  };
 
   const turnOn = async () => {
     setBusy(true);
@@ -1206,14 +1254,35 @@ function Notifications({ store }) {
         </div>
       )}
       {on && <button type="button" className="btn btn-outline btn-block" onClick={test} disabled={busy}>Send a test notification</button>}
-      <h3 className="sub-head">You'll hear about</h3>
-      <ul className="plain-list">
-        <li>Meals, water, wees, poos, walks and daycare days when someone else logs them</li>
-        <li>8am: flea or worming due or overdue, food running low, appointments that day</li>
-        <li>12pm: if no meal has been logged</li>
-        <li>4pm: if he hasn't been walked</li>
-        <li>6pm: if fewer than two meals have been logged</li>
-      </ul>
+      {on ? (
+        <>
+          <h3 className="sub-head">This phone hears about</h3>
+          <ul className="list notify-list">
+            {NOTIFY_GROUPS.map((g) => (
+              <li key={g.key}>
+                <label className="toggle notify-toggle">
+                  <input type="checkbox" checked={chosen.includes(g.key)} onChange={(e) => choose(g.key, e.target.checked)} />
+                  <span className="toggle-ui" aria-hidden="true" />
+                  <span className="log-main"><span className="log-title">{g.label}</span>{g.sub && <span className="log-sub">{g.sub}</span>}</span>
+                </label>
+              </li>
+            ))}
+          </ul>
+          <p className="fineprint">You don't get told about things you log yourself.</p>
+        </>
+      ) : (
+        <>
+          <h3 className="sub-head">You'll hear about</h3>
+          <ul className="plain-list">
+            <li>Meals, water, wees, poos, walks and daycare days when someone else logs them</li>
+            <li>8am: flea or worming due or overdue, food to buy, appointments that day</li>
+            <li>12pm: if no meal has been logged</li>
+            <li>4pm: if he hasn't been walked or gone to daycare</li>
+            <li>6pm: if fewer than two meals have been logged</li>
+          </ul>
+          <p className="fineprint">Once they're on, you can choose which of these this phone gets.</p>
+        </>
+      )}
       {store.subs.length > 0 && (
         <>
           <h3 className="sub-head">Phones with notifications on</h3>
@@ -1257,8 +1326,6 @@ function BarneyScreen({ store, open, photo, sub, session }) {
   const status = store.settings.icloud_status;
   const alexaKey = store.settings.alexa_key;
   const alexaUrl = alexaKey ? `${SUPABASE_URL}/functions/v1/bt-alexa?key=${alexaKey}` : null;
-  const food = store.settings.food || { pouches: 0, alert_at: 5 };
-
   useEffect(() => {
     if (sub) { const el = document.getElementById(sub); if (el) setTimeout(() => el.scrollIntoView({ behavior: "smooth", block: "start" }), 50); }
   }, [sub]);
@@ -1367,7 +1434,7 @@ function BarneyScreen({ store, open, photo, sub, session }) {
         <h2>Settings</h2>
         <ul className="list settings">
           <li className="setting">
-            <span className="log-main"><span className="log-title">Food cupboard</span><span className="log-sub">Warns you at {plural(Number(food.alert_at) || 0, "pouch", "pouches")}</span></span>
+            <span className="log-main"><span className="log-title">Food cupboard</span><span className="log-sub">Reminds you to buy more with about {plural(foodStatus(store).alertDays, "day")} left</span></span>
             <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "food" })}>Change</button>
           </li>
           <li className="setting">
@@ -1526,7 +1593,7 @@ async function importFromOldApp(onStep) {
     const merged = { ...now };
     for (const f of [...INFO_FIELDS.map((x) => x.key), "notes"]) if (!merged[f] && info && info[f]) merged[f] = info[f];
     await sb.from("bt_settings").upsert({ key: "info", value: merged });
-    if (food && food.pouches != null) await sb.rpc("bt_food_update", { p_delta: 0, p_pouches: Number(food.pouches), p_alert_at: Number(food.alert_at) || 5 });
+    if (food && food.pouches != null) await sb.rpc("bt_food_update", { p_set: Number(food.pouches) });
   });
   await sb.from("bt_settings").upsert({ key: "imported_at", value: new Date().toISOString() });
 
@@ -1928,32 +1995,57 @@ function TreatmentSheet({ store, kind, onClose }) {
   );
 }
 
-function FoodSheet({ store, onClose }) {
-  const food = store.settings.food || { pouches: 0, alert_at: 5 };
-  const [pouches, setPouches] = useState(Number(food.pouches) || 0);
-  const [alertAt, setAlertAt] = useState(Number(food.alert_at) || 5);
-  const save = (e) => {
+const BOXES = [12, 24, 48];
+function FoodSheet({ store, buy, onClose }) {
+  const food = foodStatus(store);
+  const [mode, setMode] = useState(buy || !food.known ? "buy" : "count");
+  const [bought, setBought] = useState("");
+  const [count, setCount] = useState(String(Math.round(food.left)));
+  const [alertDays, setAlertDays] = useState(food.alertDays);
+  const add = (n) => {
+    store.food({ p_add: n });
+    toast(`${plural(n, "pouch", "pouches")} added`);
+    onClose();
+  };
+  const saveCount = (e) => {
     e.preventDefault();
-    store.food({ p_pouches: Math.max(0, Number(pouches) || 0), p_alert_at: Math.max(0, Number(alertAt) || 0) });
+    const n = Math.max(0, Math.round(Number(count) || 0));
+    store.food({ p_set: n, p_alert_days: Math.max(0, Number(alertDays) || 0) });
     toast("Food cupboard updated");
     onClose();
   };
-  const Count = ({ id, label, value, setValue }) => (
-    <Field label={label} id={id}>
-      <div className="counter">
-        <button type="button" className="step" onClick={() => setValue(Math.max(0, (Number(value) || 0) - 1))} aria-label={`${label}: one fewer`}><Icon name="minus" size={20} /></button>
-        <input id={id} className="input counter-input" type="number" inputMode="numeric" min="0" value={value} onChange={(e) => setValue(e.target.value)} />
-        <button type="button" className="step" onClick={() => setValue((Number(value) || 0) + 1)} aria-label={`${label}: one more`}><Icon name="plus" size={20} /></button>
-      </div>
-    </Field>
-  );
   return (
-    <Sheet title="Food cupboard" onClose={onClose}>
-      <form className="sheet-body" onSubmit={save}>
-        {Count({ id: "pouches", label: "Pouches in the cupboard", value: pouches, setValue: setPouches })}
-        {Count({ id: "alert-at", label: "Warn when there are this many left", value: alertAt, setValue: setAlertAt })}
-        <button type="submit" className="btn btn-primary btn-block">Save</button>
-      </form>
+    <Sheet title={mode === "buy" ? "Bought food" : "Food cupboard"} onClose={onClose}>
+      {mode === "buy" ? (
+        <form className="sheet-body" onSubmit={(e) => { e.preventDefault(); const n = Math.round(Number(bought)); if (n > 0) add(n); }}>
+          <p className="block-note">{food.known && food.left > 0 ? `Added to the ${plural(Math.round(food.left), "pouch", "pouches")} already there.` : "How many pouches did you buy?"}</p>
+          <div className="minutes">
+            {BOXES.map((n) => (
+              <button key={n} type="button" className="minute" onClick={() => add(n)}><b>{n}</b><span>pouches</span></button>
+            ))}
+          </div>
+          <Field label="Or how many" id="bought">
+            <input id="bought" className="input input-short" type="number" inputMode="numeric" min="1" value={bought} onChange={(e) => setBought(e.target.value)} />
+          </Field>
+          <button type="submit" className="btn btn-primary btn-block" disabled={!(Number(bought) > 0)}>Add to the cupboard</button>
+          <button type="button" className="link-more" onClick={() => setMode("count")}>Count what's there instead</button>
+        </form>
+      ) : (
+        <form className="sheet-body" onSubmit={saveCount}>
+          <p className="block-note">
+            {food.known ? `Worked out from the meals logged: about ${plural(Math.round(food.left), "pouch", "pouches")}, going at ${Math.round(food.perDay * 10) / 10} a day.` : "Not counted yet."}
+            {" "}If it's wrong, put the real number in.
+          </p>
+          <Field label="Pouches in the cupboard now" id="pouches">
+            <input id="pouches" className="input input-short" type="number" inputMode="numeric" min="0" value={count} onChange={(e) => setCount(e.target.value)} />
+          </Field>
+          <Field label="Remind me to buy more with this many days left" id="alert-days">
+            <input id="alert-days" className="input input-short" type="number" inputMode="numeric" min="0" value={alertDays} onChange={(e) => setAlertDays(e.target.value)} />
+          </Field>
+          <button type="submit" className="btn btn-primary btn-block">Save</button>
+          <button type="button" className="link-more" onClick={() => setMode("buy")}>Bought food</button>
+        </form>
+      )}
     </Sheet>
   );
 }
@@ -2109,7 +2201,7 @@ function Main({ session }) {
 
   let screen;
   if (route.tab === "diary") screen = <DiaryScreen store={store} open={setSheet} />;
-  else if (route.tab === "health") screen = <HealthScreen store={store} open={setSheet} />;
+  else if (route.tab === "health") screen = <HealthScreen store={store} open={setSheet} onLogged={onLogged} />;
   else if (route.tab === "barney") screen = <BarneyScreen store={store} open={setSheet} photo={photo} sub={route.sub} session={session} />;
   else screen = <TodayScreen store={store} open={setSheet} onLogged={onLogged} photo={photo} />;
 
@@ -2138,7 +2230,7 @@ function Main({ session }) {
         sheetEl = <InfoSheet store={store} onClose={close} />;
         break;
       case "food":
-        sheetEl = <FoodSheet store={store} onClose={close} />;
+        sheetEl = <FoodSheet store={store} buy={sheet.buy} onClose={close} />;
         break;
       case "treatment":
         sheetEl = <TreatmentSheet store={store} kind={sheet.kind} onClose={close} />;

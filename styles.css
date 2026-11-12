@@ -217,7 +217,7 @@ code { font-size: .9em; background: var(--apricot-soft); padding: 1px 6px; borde
 .cupboard-count { flex: 1; display: flex; align-items: center; gap: 12px; border: 0; background: none; padding: 0; text-align: left; min-height: 44px; }
 .cupboard-count > svg { color: var(--tan); flex-shrink: 0; }
 .cupboard-count > span { display: flex; flex-direction: column; }
-.cupboard-num { font-family: var(--display); font-weight: 700; font-size: 21px; color: var(--navy); line-height: 1.1; }
+.cupboard-num { font-family: var(--display); font-weight: 700; font-size: 19px; color: var(--navy); line-height: 1.1; }
 .cupboard-sub { font-size: 14px; color: var(--ink-soft); }
 .cupboard.is-low { border-color: #E9B3A6; background: #FFF6F2; }
 .cupboard.is-low .cupboard-num, .cupboard.is-low .cupboard-sub { color: var(--alert); }
@@ -283,6 +283,9 @@ input[type="date"].input, input[type="time"].input, input[type="datetime-local"]
 .toggle input:checked + .toggle-ui { background: var(--ok); }
 .toggle input:checked + .toggle-ui::after { transform: translateX(20px); }
 .toggle input:focus-visible + .toggle-ui { outline: 3px solid var(--tan); outline-offset: 2px; }
+.notify-list li { padding: 4px 14px; }
+.notify-toggle { margin: 0; min-height: 56px; }
+.notify-toggle .log-main { flex: 1; }
 
 .notice { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-radius: 14px; font-weight: 600; margin-bottom: 12px; }
 .notice-ok { background: var(--ok-soft); color: var(--ok); }

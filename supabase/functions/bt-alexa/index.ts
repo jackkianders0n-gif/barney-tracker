@@ -45,7 +45,7 @@ Deno.serve(async (req: Request) => {
     latest(["fed", "water"]),
     latest(["wee"]),
     latest(["poo"]),
-    admin.from("bt_settings").select("value").eq("key", "food").maybeSingle(),
+    admin.rpc("bt_food_status"),
     admin.from("bt_log").select("details").eq("kind", "walk").gte("at", dayStart),
     admin.from("bt_appointments").select("*").eq("kind", "vet").gte("day", today).order("day").order("at_time").limit(1).maybeSingle(),
     latest(["flea"]),
@@ -71,7 +71,10 @@ Deno.serve(async (req: Request) => {
     lastFeed,
     lastWee: toilet(wee.data),
     lastPoo: toilet(poo.data),
-    food: food.data?.value ?? { pouches: 0, alert_at: 5 },
+    // Estimated from meals logged since the last shop, in the old { pouches, alert_at } shape
+    food: food.data?.counted_at
+      ? { pouches: Math.round(Number(food.data.left ?? 0)), alert_at: Math.round(Number(food.data.alert_days ?? 5) * Number(food.data.per_day ?? 2)) }
+      : { pouches: 0, alert_at: 5 },
     todayWalkMins: (walks.data ?? []).reduce((n: number, w: any) => n + (Number(w.details?.mins) || 0), 0),
     nextVet: vet.data ? {
       id: vet.data.id,

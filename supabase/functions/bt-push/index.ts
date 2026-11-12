@@ -2,7 +2,8 @@
 //
 // POST {"action":"vapid"}            → the public key phones subscribe with (members)
 // POST {"action":"test"}             → a test notification to your own phones (members)
-// POST {"action":"log","id":"<id>"}  → tell everyone else about a new log (database trigger)
+// POST {"action":"log","id":"<id>"}  → tell everyone else about a new log (database trigger),
+//                                      on the phones that chose to hear about that kind
 // POST {"action":"check"}            → the 8am / 12pm / 4pm / 6pm reminders (hourly cron job)
 //
 // Needs "Verify JWT" turned OFF: the database can't sign in. Calls from the
@@ -37,7 +38,11 @@ function json(body: unknown, status = 200): Response {
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void } | undefined;
 
 type Admin = ReturnType<typeof createClient>;
-type Message = { title: string; body: string; tag: string; url?: string };
+// group: which of a phone's notification choices (bt_push_subscriptions.notify) it belongs to.
+// null notify = everything.
+type Message = { title: string; body: string; tag: string; url?: string; group?: string };
+const LOG_GROUP: Record<string, string> = { fed: "fed", water: "water", wee: "toilet", poo: "toilet", walk: "walk", daycare: "walk" };
+const wants = (s: any, group?: string) => !group || !Array.isArray(s.notify) || s.notify.includes(group);
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
@@ -132,7 +137,8 @@ async function sendLog(admin: Admin, id: string) {
   if (!msg) return { sent: 0 };
   const { data: subs } = await admin.from("bt_push_subscriptions").select("*");
   // Everyone except the person who logged it
-  const targets = (subs ?? []).filter((s: any) => !log.created_by || s.user_id !== log.created_by);
+  const group = LOG_GROUP[log.kind];
+  const targets = (subs ?? []).filter((s: any) => (!log.created_by || s.user_id !== log.created_by) && wants(s, group));
   return await sendToAll(admin, targets, msg);
 }
 
@@ -178,11 +184,21 @@ async function runReminders(admin: Admin, forceHour: number | null) {
   const messages: Message[] = [];
 
   if (hour === 8) {
-    const { data: food } = await admin.from("bt_settings").select("value").eq("key", "food").maybeSingle();
-    const pouches = Number(food?.value?.pouches ?? 0);
-    const alertAt = Number(food?.value?.alert_at ?? 5);
-    if (pouches === 0) messages.push({ title: "Barney's out of food", body: "There are no pouches left in the cupboard.", tag: "food" });
-    else if (pouches <= alertAt) messages.push({ title: "Barney's food is running low", body: `Only ${pouches} ${pouches === 1 ? "pouch" : "pouches"} left.`, tag: "food" });
+    // Food left is estimated from the meals logged since the last shop or count
+    const { data: food } = await admin.rpc("bt_food_status");
+    if (food?.counted_at) {
+      const left = Number(food.left ?? 0);
+      const days = food.days_left == null ? null : Number(food.days_left);
+      const about = Math.max(1, Math.round(left));
+      if (left <= 0) messages.push({ title: "Time to buy Barney's food", body: "By the meals logged, his pouches have run out.", tag: "food", group: "care" });
+      else if (days != null && days <= Number(food.alert_days ?? 5)) {
+        messages.push({
+          title: "Time to buy Barney's food",
+          body: `About ${about} ${about === 1 ? "pouch" : "pouches"} left, roughly ${days} ${days === 1 ? "day" : "days"}.`,
+          tag: "food", group: "care",
+        });
+      }
+    }
 
     for (const t of await treatmentDates(admin)) {
       if (!t.due || t.due > local.date) continue;
@@ -192,6 +208,7 @@ async function runReminders(admin: Admin, forceHour: number | null) {
         title: late > 0 ? `Barney's ${t.label} is overdue` : `Barney's ${t.label} is due today`,
         body: [late > 0 ? `${late} ${late === 1 ? "day" : "days"} late.` : "", lastText].filter(Boolean).join(" ") || "It's due today.",
         tag: t.kind,
+        group: "care",
       });
     }
 
@@ -199,26 +216,30 @@ async function runReminders(admin: Admin, forceHour: number | null) {
     for (const a of appts ?? []) {
       const what = a.kind === "vet" ? "vet" : "grooming";
       const when = a.at_time ? `At ${clock(new Date(`${a.day}T${a.at_time.slice(0, 5)}:00Z`), "UTC")}` : "Today";
-      messages.push({ title: `Barney's ${what} appointment is today`, body: `${when}${a.title ? `: ${a.title}` : ""}.`, tag: `appt-${a.id}` });
+      messages.push({ title: `Barney's ${what} appointment is today`, body: `${when}${a.title ? `: ${a.title}` : ""}.`, tag: `appt-${a.id}`, group: "care" });
     }
   }
 
   if (hour === 12 || hour === 18) {
     const { count } = await admin.from("bt_log").select("id", { count: "exact", head: true }).eq("kind", "fed").gte("at", dayStart);
     const meals = count ?? 0;
-    if (hour === 12 && meals === 0) messages.push({ title: "Has Barney had breakfast?", body: "No meal logged yet today.", tag: "fed-reminder" });
-    if (hour === 18 && meals < 2) messages.push({ title: "Time for Barney's dinner?", body: meals === 0 ? "No meals logged today." : "Only one meal logged today.", tag: "fed-reminder" });
+    if (hour === 12 && meals === 0) messages.push({ title: "Has Barney had breakfast?", body: "No meal logged yet today.", tag: "fed-reminder", group: "nudges" });
+    if (hour === 18 && meals < 2) messages.push({ title: "Time for Barney's dinner?", body: meals === 0 ? "No meals logged today." : "Only one meal logged today.", tag: "fed-reminder", group: "nudges" });
   }
 
   if (hour === 16) {
-    const { count } = await admin.from("bt_log").select("id", { count: "exact", head: true }).in("kind", ["walk", "daycare"]).gte("at", dayStart);
-    if (!count) messages.push({ title: "Has Barney been walked?", body: "No walk logged yet today.", tag: "walk-reminder" });
+    // A walk or daycare logged today, or a daycare plan for today, counts
+    const [{ count }, { count: daycarePlans }] = await Promise.all([
+      admin.from("bt_log").select("id", { count: "exact", head: true }).in("kind", ["walk", "daycare"]).gte("at", dayStart),
+      admin.from("bt_plans").select("id", { count: "exact", head: true }).eq("day", local.date).eq("place", "daycare"),
+    ]);
+    if (!count && !daycarePlans) messages.push({ title: "Has Barney been walked?", body: "No walk logged yet today.", tag: "walk-reminder", group: "nudges" });
   }
 
   if (!messages.length) return { hour, sent: 0 };
   const { data: subs } = await admin.from("bt_push_subscriptions").select("*");
   let sent = 0;
-  for (const m of messages) sent += (await sendToAll(admin, subs ?? [], m)).sent;
+  for (const m of messages) sent += (await sendToAll(admin, (subs ?? []).filter((s: any) => wants(s, m.group)), m)).sent;
   return { hour, sent, messages: messages.map((m) => m.title) };
 }
 
