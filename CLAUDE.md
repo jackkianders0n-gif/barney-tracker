@@ -17,7 +17,7 @@ A shared phone app for Jack, Jakey and Mum to look after Barney (a cockapoo): on
 
 ## Rules that bite
 - **Bump `CACHE` in `sw.js` and `APP_VERSION` in `app.jsx` on every change to app files**, or the phones keep the old version.
-- CDN scripts: pinned versions on cdn.jsdelivr.net, UMD builds (supabase-js: `dist/umd/supabase.js`).
+- CDN scripts: exact pinned versions on cdn.jsdelivr.net (never `@2`), UMD builds (supabase-js: `dist/umd/supabase.js`). The same URLs are in `index.html` and `LIBRARIES` in `sw.js`; change both together.
 - `SUPABASE_URL` in `app.jsx` must be the bare project URL — no trailing slash, no `/rest/v1/`. The publishable key is fine in public code; access rules protect the data.
 - The project URL is also written into `bt_call()` in `schema.sql` (the database calls the functions with it).
 - Never commit personal emails or secrets. `supabase/schema.sql` keeps placeholder emails on purpose.

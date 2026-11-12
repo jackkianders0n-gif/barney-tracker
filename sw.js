@@ -1,6 +1,6 @@
 // Barney's Tracker service worker
 // Bump CACHE on every deploy (barney-v1 → barney-v2 …) so phones drop the old copy.
-const CACHE = "barney-v2";
+const CACHE = "barney-v3";
 
 const APP_FILES = [
   "./",
@@ -16,8 +16,8 @@ const APP_FILES = [
 const LIBRARIES = [
   "https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js",
   "https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js",
-  "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js",
-  "https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js",
+  "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.119.0/dist/umd/supabase.js",
+  "https://cdn.jsdelivr.net/npm/@babel/standalone@7.29.14/babel.min.js",
 ];
 
 self.addEventListener("install", (event) => {
