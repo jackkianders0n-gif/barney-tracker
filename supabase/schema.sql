@@ -112,7 +112,8 @@ create index if not exists bt_appointments_day_idx on public.bt_appointments (da
 
 
 -- 5. Shared settings: food cupboard, Barney's details, photo, Alexa link key,
---    iCloud sync status
+--    iCloud sync status, flea and worming schedule
+--    (treatments: { flea: { every, unit: days|weeks|months, due?, due_set_at? }, worm: … })
 create table if not exists public.bt_settings (
   key    text primary key,
   value  jsonb not null
@@ -294,6 +295,42 @@ create trigger bt_plans_calendar after insert or update or delete on public.bt_p
 drop trigger if exists bt_appointments_calendar on public.bt_appointments;
 create trigger bt_appointments_calendar after insert or update or delete on public.bt_appointments
   for each row execute function public.bt_calendar_notify();
+
+-- When flea and worming are next due also goes into the calendar: it moves when
+-- a dose is logged, changed or removed, or the due date or how often is changed
+create or replace function public.bt_treatment_calendar()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare hit boolean := false;
+begin
+  if tg_table_name = 'bt_settings' then
+    hit := new.key = 'treatments';
+  else
+    if tg_op <> 'DELETE' then
+      -- imported rows are sent in one go by "Sync calendar now" instead
+      hit := new.kind in ('flea','worm') and not (tg_op = 'INSERT' and new.legacy_id is not null);
+    end if;
+    if tg_op <> 'INSERT' and not hit then
+      hit := old.kind in ('flea','worm');
+    end if;
+  end if;
+  if hit then
+    perform public.bt_call('bt-calendar', jsonb_build_object('type', 'treat'));
+  end if;
+  return null;
+end;
+$$;
+revoke all on function public.bt_treatment_calendar() from public;
+
+drop trigger if exists bt_log_treatment_calendar on public.bt_log;
+create trigger bt_log_treatment_calendar after insert or update or delete on public.bt_log
+  for each row execute function public.bt_treatment_calendar();
+drop trigger if exists bt_settings_treatment_calendar on public.bt_settings;
+create trigger bt_settings_treatment_calendar after insert or update on public.bt_settings
+  for each row execute function public.bt_treatment_calendar();
 
 -- Reminders: every hour, bt-push checks the UK time and sends the 8am, 12pm,
 -- 4pm and 6pm reminders when they're due (so it's right in summer and winter).

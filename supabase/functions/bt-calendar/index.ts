@@ -1,8 +1,10 @@
 // Barney's Tracker — calendar Edge Function
 //
-// Puts Barney's plans (where he'll be) and his vet and grooming appointments
-// into a shared iCloud calendar, default name "Barney":
+// Puts Barney's plans (where he'll be), his vet and grooming appointments and
+// when his flea and worming treatments are next due into a shared iCloud
+// calendar, default name "Barney":
 // POST {"type":"plan"|"appt","id":"<id>"} → add, change or remove one event (database trigger)
+// POST {"type":"treat"}                   → move the flea and worming events (database trigger)
 // POST {"all": true}                      → bring the calendar in line with the app (Barney → Sync calendar now)
 // Results go into bt_settings as icloud_status.
 //
@@ -31,6 +33,13 @@ function json(body: unknown, status = 200): Response {
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void } | undefined;
 type Admin = ReturnType<typeof createClient>;
 
+// Flea and worming: how often unless changed in the app (bt_settings.treatments).
+// The same rules as treatmentPlan() in app.jsx, also repeated in bt-push.
+const TREATMENTS = [
+  { kind: "flea", label: "flea treatment", every: 4, unit: "weeks" },
+  { kind: "worm", label: "worming tablet", every: 3, unit: "months" },
+];
+
 const PLACES: Record<string, string> = {
   home: "at home",
   mum: "at Mum's house",
@@ -56,9 +65,10 @@ Deno.serve(async (req: Request) => {
     const result = await syncAll(admin);
     return json(result, result.ok ? 200 : 400);
   }
-  if (!["plan", "appt"].includes(body?.type) || typeof body?.id !== "string") return json({ error: "Missing type or id" }, 400);
+  const treat = body?.type === "treat";
+  if (!treat && (!["plan", "appt"].includes(body?.type) || typeof body?.id !== "string")) return json({ error: "Missing type or id" }, 400);
   // The trigger doesn't wait, so reply at once and carry on in the background
-  const work = syncOne(admin, body.type, body.id);
+  const work = treat ? syncTreatments(admin) : syncOne(admin, body.type, body.id);
   if (typeof EdgeRuntime !== "undefined" && EdgeRuntime?.waitUntil) {
     EdgeRuntime.waitUntil(work);
     return json({ ok: true }, 202);
@@ -110,6 +120,27 @@ async function syncOne(admin: Admin, kind: Kind, id: string) {
   }
 }
 
+async function syncTreatments(admin: Admin) {
+  try {
+    await putTreatments(admin, await findCalendar());
+    return await saveStatus(admin, { ok: true });
+  } catch (e) {
+    return await saveStatus(admin, { ok: false, error: messageOf(e) });
+  }
+}
+
+// One all-day event per treatment, on the day it's next due (bt-treat-flea.ics,
+// bt-treat-worm.ics). Moves when a dose is logged or the due date is changed.
+async function putTreatments(admin: Admin, cal: Calendar): Promise<number> {
+  let count = 0;
+  for (const t of await treatmentDates(admin)) {
+    const url = `${cal.url}bt-treat-${t.kind}.ics`;
+    if (t.due) { await putFile(cal, url, buildTreatmentEvent(t)); count++; }
+    else await deleteEvent(cal, url);
+  }
+  return count;
+}
+
 async function syncAll(admin: Admin) {
   try {
     const cal = await findCalendar();
@@ -124,6 +155,7 @@ async function syncAll(admin: Admin) {
     if (plans.error || appts.error || planIds.error || apptIds.error) throw new FriendlyError("Couldn't load plans and appointments");
     for (const p of plans.data ?? []) await putEvent(cal, "plan", p, who);
     for (const a of appts.data ?? []) await putEvent(cal, "appt", a, who);
+    const treats = await putTreatments(admin, cal);
 
     // Remove events for plans and appointments that have been deleted. Only touches
     // events this app made (bt-plan-<id>.ics / bt-appt-<id>.ics), never your own.
@@ -136,7 +168,7 @@ async function syncAll(admin: Admin) {
         removed++;
       }
     }
-    return await saveStatus(admin, { ok: true, count: (plans.data?.length ?? 0) + (appts.data?.length ?? 0), removed });
+    return await saveStatus(admin, { ok: true, count: (plans.data?.length ?? 0) + (appts.data?.length ?? 0) + treats, removed });
   } catch (e) {
     return await saveStatus(admin, { ok: false, error: messageOf(e) });
   }
@@ -233,10 +265,11 @@ async function findCalendar(): Promise<Calendar> {
 }
 
 async function putEvent(cal: Calendar, kind: Kind, row: any, who: Record<string, string>) {
-  const res = await dav(`${cal.url}${fileName(kind, row.id)}`, cal.auth, "PUT", {
-    body: buildEvent(kind, row, who),
-    type: "text/calendar; charset=utf-8",
-  });
+  await putFile(cal, `${cal.url}${fileName(kind, row.id)}`, buildEvent(kind, row, who));
+}
+
+async function putFile(cal: Calendar, url: string, body: string) {
+  const res = await dav(url, cal.auth, "PUT", { body, type: "text/calendar; charset=utf-8" });
   if (!res.ok) throw new FriendlyError(`iCloud wouldn't save an event (error ${res.status}).`);
   await res.body?.cancel();
 }
@@ -285,6 +318,60 @@ function buildEvent(kind: Kind, row: any, who: Record<string, string>): string {
   }
   lines.push("END:VEVENT", "END:VCALENDAR");
   return lines.map(fold).join("\r\n") + "\r\n";
+}
+
+type TreatmentDate = { kind: string; label: string; every: number; unit: string; last: string | null; due: string | null; custom: boolean };
+
+function buildTreatmentEvent(t: TreatmentDate): string {
+  const summary = `Barney's ${t.label} due`;
+  const how = t.every === 1 ? `Every ${t.unit.slice(0, -1)}` : `Every ${t.every} ${t.unit}`;
+  const last = t.last
+    ? `Last done ${new Intl.DateTimeFormat("en-GB", { timeZone: TZ, day: "numeric", month: "long" }).format(new Date(t.last))}`
+    : null;
+  const lines = [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Barney's Tracker//EN", "CALSCALE:GREGORIAN", "BEGIN:VEVENT",
+    `UID:bt-treat-${t.kind}@barney-tracker`, `DTSTAMP:${utc(new Date())}`, `LAST-MODIFIED:${utc(new Date())}`,
+    `DTSTART;VALUE=DATE:${t.due!.replace(/-/g, "")}`, `DTEND;VALUE=DATE:${nextDay(t.due!)}`,
+    `SUMMARY:${escapeText(summary)}`,
+    `DESCRIPTION:${escapeText([last, how, "Log it in Barney's Tracker when it's done."].filter(Boolean).join("\n"))}`,
+    // A reminder at 6pm the evening before, like all-day appointments
+    "BEGIN:VALARM", "ACTION:DISPLAY", `DESCRIPTION:${escapeText(summary)}`, "TRIGGER:-PT6H", "END:VALARM",
+    "END:VEVENT", "END:VCALENDAR",
+  ];
+  return lines.map(fold).join("\r\n") + "\r\n";
+}
+
+// When each treatment is next due (UK date): the date set in the app until the
+// next dose is logged, otherwise the last dose plus how often it's given
+async function treatmentDates(admin: Admin): Promise<TreatmentDate[]> {
+  const [setting, ...lasts] = await Promise.all([
+    admin.from("bt_settings").select("value").eq("key", "treatments").maybeSingle(),
+    ...TREATMENTS.map((t) => admin.from("bt_log").select("at").eq("kind", t.kind).order("at", { ascending: false }).limit(1).maybeSingle()),
+  ]);
+  if (setting.error || lasts.some((r) => r.error)) throw new FriendlyError("Couldn't load flea and worming dates");
+  return TREATMENTS.map((t, i) => {
+    const cfg = (setting.data?.value as any)?.[t.kind] ?? {};
+    const every = Math.max(1, Math.round(Number(cfg.every)) || t.every);
+    const unit = ["days", "weeks", "months"].includes(cfg.unit) ? cfg.unit : t.unit;
+    const last: string | null = (lasts[i].data as any)?.at ?? null;
+    const custom = typeof cfg.due === "string" && /^\d{4}-\d{2}-\d{2}$/.test(cfg.due) &&
+      (!last || new Date(last) < new Date(cfg.due_set_at ?? 0));
+    const due: string | null = custom ? cfg.due : last ? addInterval(londonDate(new Date(last)), every, unit) : null;
+    return { ...t, every, unit, last, due, custom };
+  });
+}
+function addInterval(date: string, n: number, unit: string): string {
+  const [y, m, d] = date.split("-").map(Number);
+  if (unit === "months") {
+    const lastDay = new Date(Date.UTC(y, m + n, 0)).getUTCDate();
+    return new Date(Date.UTC(y, m - 1 + n, Math.min(d, lastDay))).toISOString().slice(0, 10);
+  }
+  return new Date(Date.UTC(y, m - 1, d + (unit === "weeks" ? n * 7 : n))).toISOString().slice(0, 10);
+}
+function londonDate(d: Date): string {
+  const p: Record<string, string> = {};
+  for (const x of new Intl.DateTimeFormat("en-GB", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d)) p[x.type] = x.value;
+  return `${p.year}-${p.month}-${p.day}`;
 }
 
 // A UK wall-clock time on a date, as a real instant (handles summer time)

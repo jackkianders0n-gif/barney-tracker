@@ -17,8 +17,12 @@ import { createClient } from "npm:@supabase/supabase-js@2";
 
 const APP_URL = "https://jackkianders0n-gif.github.io/barney-tracker/";
 const TZ = "Europe/London";
-const FLEA_DAYS = 28;
-const WORM_DAYS = 90;
+// Flea and worming: how often unless changed in the app (bt_settings.treatments).
+// The same rules as treatmentPlan() in app.jsx, also repeated in bt-calendar.
+const TREATMENTS = [
+  { kind: "flea", label: "flea treatment", every: 4, unit: "weeks" },
+  { kind: "worm", label: "worming tablet", every: 3, unit: "months" },
+];
 const LOG_DELAY_MS = 12000; // wait before sending, so an Undo in the app cancels it
 
 const CORS: Record<string, string> = {
@@ -180,11 +184,15 @@ async function runReminders(admin: Admin, forceHour: number | null) {
     if (pouches === 0) messages.push({ title: "Barney's out of food", body: "There are no pouches left in the cupboard.", tag: "food" });
     else if (pouches <= alertAt) messages.push({ title: "Barney's food is running low", body: `Only ${pouches} ${pouches === 1 ? "pouch" : "pouches"} left.`, tag: "food" });
 
-    for (const [kind, every, label] of [["flea", FLEA_DAYS, "flea treatment"], ["worm", WORM_DAYS, "worming tablet"]] as const) {
-      const { data: last } = await admin.from("bt_log").select("at").eq("kind", kind).order("at", { ascending: false }).limit(1).maybeSingle();
-      if (!last) continue;
-      const days = Math.floor((now.getTime() - new Date(last.at).getTime()) / 86400000);
-      if (days >= every) messages.push({ title: `Barney's ${label} is due`, body: `Last done ${days} days ago.`, tag: kind });
+    for (const t of await treatmentDates(admin)) {
+      if (!t.due || t.due > local.date) continue;
+      const late = daysFrom(t.due, local.date);
+      const lastText = t.last ? `Last done ${Math.floor((now.getTime() - new Date(t.last).getTime()) / 86400000)} days ago.` : "";
+      messages.push({
+        title: late > 0 ? `Barney's ${t.label} is overdue` : `Barney's ${t.label} is due today`,
+        body: [late > 0 ? `${late} ${late === 1 ? "day" : "days"} late.` : "", lastText].filter(Boolean).join(" ") || "It's due today.",
+        tag: t.kind,
+      });
     }
 
     const { data: appts } = await admin.from("bt_appointments").select("*").eq("day", local.date).order("at_time");
@@ -212,6 +220,36 @@ async function runReminders(admin: Admin, forceHour: number | null) {
   let sent = 0;
   for (const m of messages) sent += (await sendToAll(admin, subs ?? [], m)).sent;
   return { hour, sent, messages: messages.map((m) => m.title) };
+}
+
+// When each treatment is next due (UK date): the date set in the app until the
+// next dose is logged, otherwise the last dose plus how often it's given
+async function treatmentDates(admin: Admin) {
+  const [setting, ...lasts] = await Promise.all([
+    admin.from("bt_settings").select("value").eq("key", "treatments").maybeSingle(),
+    ...TREATMENTS.map((t) => admin.from("bt_log").select("at").eq("kind", t.kind).order("at", { ascending: false }).limit(1).maybeSingle()),
+  ]);
+  return TREATMENTS.map((t, i) => {
+    const cfg = (setting.data?.value as any)?.[t.kind] ?? {};
+    const every = Math.max(1, Math.round(Number(cfg.every)) || t.every);
+    const unit = ["days", "weeks", "months"].includes(cfg.unit) ? cfg.unit : t.unit;
+    const last: string | null = (lasts[i].data as any)?.at ?? null;
+    const custom = typeof cfg.due === "string" && /^\d{4}-\d{2}-\d{2}$/.test(cfg.due) &&
+      (!last || new Date(last) < new Date(cfg.due_set_at ?? 0));
+    const due: string | null = custom ? cfg.due : last ? addInterval(londonParts(new Date(last)).date, every, unit) : null;
+    return { ...t, every, unit, last, due, custom };
+  });
+}
+function addInterval(date: string, n: number, unit: string): string {
+  const [y, m, d] = date.split("-").map(Number);
+  if (unit === "months") {
+    const lastDay = new Date(Date.UTC(y, m + n, 0)).getUTCDate();
+    return new Date(Date.UTC(y, m - 1 + n, Math.min(d, lastDay))).toISOString().slice(0, 10);
+  }
+  return new Date(Date.UTC(y, m - 1, d + (unit === "weeks" ? n * 7 : n))).toISOString().slice(0, 10);
+}
+function daysFrom(a: string, b: string): number {
+  return Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000);
 }
 
 function londonParts(d: Date) {

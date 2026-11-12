@@ -373,9 +373,12 @@ input[type="date"].input, input[type="time"].input, input[type="datetime-local"]
 .treatment-name { font-weight: 700; line-height: 1.2; display: flex; flex-direction: column; font-size: 15px; }
 .treatment-cadence { font-weight: 500; font-size: 13px; color: var(--ink-soft); }
 .treatment-due { font-family: var(--display); font-weight: 700; font-size: 22px; line-height: 1.1; color: var(--navy); }
+.treatment-next { font-size: 13px; font-weight: 700; color: var(--navy); margin-top: 6px; }
+.treatment-next + .treatment-last { margin-top: 2px; }
 .treatment-last { font-size: 13px; color: var(--ink-soft); margin-top: 6px; }
-.treatment-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.treatment-actions { display: flex; flex-direction: column; gap: 8px; margin-top: auto; padding-top: 12px; }
 .treatment-actions .btn { width: 100%; }
+.treatment-actions .btn-quiet { background: transparent; color: var(--tan-ink); margin-top: 0; gap: 6px; }
 .bar { height: 8px; border-radius: 999px; background: var(--apricot-soft); overflow: hidden; margin-top: 8px; }
 .bar span { display: block; height: 100%; border-radius: 999px; background: var(--ok); }
 .treatment.is-soon .bar span { background: var(--amber); }

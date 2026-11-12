@@ -10,7 +10,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 // ---------------------------------------------------------------------------
 const SUPABASE_URL = "https://wvedhcuebfdfkhfvphlb.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_bkeGnvruQEz3MsVDZiJ03g_bhXXDjgC";
-const APP_VERSION = "2.0.0";
+const APP_VERSION = "2.1.0";
 // The old Cloudflare app, read once by Barney → Settings → Bring over data from the old app
 const OLD_API = "https://barney-tracker-api.barneythebigdog.workers.dev";
 
@@ -21,9 +21,6 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 // ---------------------------------------------------------------------------
 // What can be logged
 // ---------------------------------------------------------------------------
-const FLEA_DAYS = 28;
-const WORM_DAYS = 90;
-
 const KIND = {
   fed:       { label: "Fed",            title: "Meal",           icon: "bowl",     group: "meals" },
   water:     { label: "Water",          title: "Water",          icon: "water",    group: "meals" },
@@ -49,10 +46,14 @@ const DIARY_FILTERS = [
   { key: "grooming", label: "Grooming" },
 ];
 
+// How often unless changed in Health → a treatment → Due date and how often
+// (bt_settings.treatments: { flea: { every, unit, due?, due_set_at? }, worm: … }).
+// The same rules are repeated in bt-push and bt-calendar.
 const TREATMENTS = [
-  { kind: "flea", label: "Flea treatment", every: FLEA_DAYS, warn: 3, cadence: "Every 4 weeks" },
-  { kind: "worm", label: "Worming tablet", every: WORM_DAYS, warn: 7, cadence: "Every 3 months" },
+  { kind: "flea", label: "Flea treatment", every: 4, unit: "weeks", warn: 3 },
+  { kind: "worm", label: "Worming tablet", every: 3, unit: "months", warn: 7 },
 ];
+const UNITS = [{ key: "days", label: "Days" }, { key: "weeks", label: "Weeks" }, { key: "months", label: "Months" }];
 
 const PLACES = [
   { key: "home",    label: "Home",          now: "At home",           icon: "home",       color: "#1B2340" },
@@ -541,22 +542,52 @@ function whereNow(plans) {
   return null;
 }
 
+// A date plus some days, weeks or months (31 Jan + 1 month = 28 or 29 Feb)
+function addInterval(d, n, unit) {
+  if (unit !== "months") return addDays(d, unit === "weeks" ? n * 7 : n);
+  const x = new Date(d);
+  const day = x.getDate();
+  x.setDate(1);
+  x.setMonth(x.getMonth() + n);
+  x.setDate(Math.min(day, new Date(x.getFullYear(), x.getMonth() + 1, 0).getDate()));
+  return x;
+}
+const cadenceText = (n, unit) => (n === 1 ? `Every ${unit.slice(0, -1)}` : `Every ${n} ${unit}`);
+
+// When a treatment is next due: the date someone set, until the next dose is
+// logged; otherwise the last dose plus how often it's given.
+function treatmentPlan(store, t) {
+  const cfg = (store.settings.treatments || {})[t.kind] || {};
+  const every = Math.max(1, Math.round(Number(cfg.every)) || t.every);
+  const unit = UNITS.some((u) => u.key === cfg.unit) ? cfg.unit : t.unit;
+  const last = latestOf(store.logs, [t.kind]);
+  const custom = !!cfg.due && (!last || new Date(last.at) < new Date(cfg.due_set_at || 0));
+  const scheduled = last ? addInterval(parseDay(dayKey(new Date(last.at))), every, unit) : null;
+  const due = custom ? parseDay(cfg.due) : scheduled;
+  const left = due ? daysBetween(new Date(), due) : null;
+  const from = custom ? new Date(cfg.due_set_at) : last ? new Date(last.at) : null;
+  const span = due && from ? Math.max(1, daysBetween(from, due)) : 1;
+  const pct = left == null ? 0 : Math.min(100, Math.max(0, (1 - left / span) * 100));
+  return { ...t, every, unit, cadence: cadenceText(every, unit), last, scheduled, due, left, custom, pct };
+}
+
 function careItems(store) {
   const items = [];
   for (const t of TREATMENTS) {
-    const last = latestOf(store.logs, [t.kind]);
-    if (!last) {
+    const p = treatmentPlan(store, t);
+    if (!p.due) {
       items.push({ key: t.kind, icon: KIND[t.kind].icon, title: `${t.label} not logged yet`, sub: "Add when it was last done", action: "set", kind: t.kind });
       continue;
     }
-    const dueIn = t.every - daysBetween(new Date(last.at), new Date());
+    const dueIn = p.left;
     if (dueIn > t.warn) continue;
+    const lastText = p.last ? `Last done ${shortDate(new Date(p.last.at))}` : null;
     items.push({
       key: t.kind,
       icon: KIND[t.kind].icon,
       urgent: dueIn <= 0,
       title: dueIn < 0 ? `${t.label} is overdue` : dueIn === 0 ? `${t.label} is due today` : `${t.label} due in ${plural(dueIn, "day")}`,
-      sub: dueIn < 0 ? `${plural(-dueIn, "day")} late. Last done ${shortDate(new Date(last.at))}` : `Last done ${shortDate(new Date(last.at))}`,
+      sub: dueIn < 0 ? [`${plural(-dueIn, "day")} late`, lastText].filter(Boolean).join(". ") : lastText,
       action: "done",
       kind: t.kind,
     });
@@ -919,25 +950,24 @@ function HealthScreen({ store, open }) {
         <h2>Treatments</h2>
         <div className="treatments">
           {TREATMENTS.map((t) => {
-            const last = latestOf(logs, [t.kind]);
-            const days = last ? daysBetween(new Date(last.at), new Date()) : null;
-            const left = days == null ? null : t.every - days;
+            const { last, due, left, pct, cadence, custom } = treatmentPlan(store, t);
             const tone = left == null ? "" : left <= 0 ? "is-urgent" : left <= t.warn ? "is-soon" : "is-ok";
-            const pct = days == null ? 0 : Math.min(100, Math.max(0, (days / t.every) * 100));
             return (
               <div key={t.kind} className={`treatment ${tone}`}>
                 <div className="treatment-top">
                   <span className="treatment-icon"><Icon name={KIND[t.kind].icon} size={24} /></span>
-                  <span className="treatment-name">{t.label}<span className="treatment-cadence">{t.cadence}</span></span>
+                  <span className="treatment-name">{t.label}<span className="treatment-cadence">{cadence}</span></span>
                 </div>
                 <p className="treatment-due">
                   {left == null ? "Not logged yet" : left < 0 ? `${plural(-left, "day")} overdue` : left === 0 ? "Due today" : `Due in ${plural(left, "day")}`}
                 </p>
                 <div className="bar" aria-hidden="true"><span style={{ width: `${pct}%` }} /></div>
+                {due && <p className="treatment-next">{`Due ${shortDate(due)}`}{custom && " (date set)"}</p>}
                 <p className="treatment-last">{last ? `Last done ${shortDate(new Date(last.at))}` : "Add when it was last done"}</p>
                 <div className="treatment-actions">
                   <button type="button" className="btn btn-small" onClick={() => { store.addLog(t.kind, {}); toast(`${t.label} logged for today`); }}>Done today</button>
                   <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "log", kind: t.kind })}>Other date</button>
+                  <button type="button" className="btn btn-small btn-quiet" onClick={() => open({ type: "treatment", kind: t.kind })}><Icon name="calendar" size={18} /> Due date</button>
                 </div>
               </div>
             );
@@ -1163,7 +1193,7 @@ function Notifications({ store }) {
       <h3 className="sub-head">You'll hear about</h3>
       <ul className="plain-list">
         <li>Meals, water, wees, poos, walks and daycare days when someone else logs them</li>
-        <li>8am: flea or worming due, food running low, appointments that day</li>
+        <li>8am: flea or worming due or overdue, food running low, appointments that day</li>
         <li>12pm: if no meal has been logged</li>
         <li>4pm: if he hasn't been walked</li>
         <li>6pm: if fewer than two meals have been logged</li>
@@ -1743,6 +1773,64 @@ function InfoSheet({ store, onClose }) {
   );
 }
 
+function TreatmentSheet({ store, kind, onClose }) {
+  const t = TREATMENTS.find((x) => x.kind === kind);
+  const p = treatmentPlan(store, t);
+  const all = store.settings.treatments || {};
+  const cfg = all[kind] || {};
+  const [every, setEvery] = useState(String(p.every));
+  const [unit, setUnit] = useState(p.unit);
+  const [due, setDue] = useState(null); // null until someone changes the date
+  const [busy, setBusy] = useState(false);
+  const n = Math.round(Number(every));
+  // The date from the last dose and how often, as the form stands
+  const scheduled = p.last && n >= 1 ? dayKey(addInterval(parseDay(dayKey(new Date(p.last.at))), n, unit)) : "";
+  const shown = due != null ? due : p.custom ? cfg.due : scheduled;
+
+  const save = async (e) => {
+    e.preventDefault();
+    if (!(n >= 1)) { toast("How often needs to be at least 1", "error"); return; }
+    const next = { every: n, unit };
+    if (due != null) {
+      if (due && due !== scheduled) { next.due = due; next.due_set_at = new Date().toISOString(); }
+    } else if (p.custom) {
+      next.due = cfg.due;
+      next.due_set_at = cfg.due_set_at;
+    }
+    setBusy(true);
+    const ok = await store.setSetting("treatments", { ...all, [kind]: next });
+    setBusy(false);
+    if (ok) { toast(`${t.label} saved`); onClose(); }
+  };
+  const useSchedule = async () => {
+    setBusy(true);
+    const ok = await store.setSetting("treatments", { ...all, [kind]: { every: p.every, unit: p.unit } });
+    setBusy(false);
+    if (ok) { toast(p.scheduled ? `Back to due ${shortDate(p.scheduled)}` : "Due date cleared"); onClose(); }
+  };
+
+  return (
+    <Sheet title={t.label} onClose={onClose}>
+      <form className="sheet-body" onSubmit={save}>
+        <Field label="Next due" id="treat-due"
+          hint={p.last ? "Change this if he's due on a different day. Once the next dose is logged, it goes back to the usual schedule." : "Not logged yet. Set when he's due, or log when it was last done."}>
+          <input id="treat-due" className="input" type="date" value={shown || ""} onChange={(e) => setDue(e.target.value)} />
+        </Field>
+        <Field label="Given every" id="treat-every">
+          <input id="treat-every" className="input input-short" type="number" inputMode="numeric" min="1" value={every} onChange={(e) => setEvery(e.target.value)} />
+        </Field>
+        <Choices label="Days, weeks or months" options={UNITS} value={unit} onChange={setUnit} />
+        <button type="submit" className="btn btn-primary btn-block" disabled={busy}>Save</button>
+        {p.custom && (
+          <button type="button" className="btn btn-outline btn-block" onClick={useSchedule} disabled={busy}>
+            {p.scheduled ? `Use the usual schedule (${shortDate(p.scheduled)})` : "Clear the due date"}
+          </button>
+        )}
+      </form>
+    </Sheet>
+  );
+}
+
 function FoodSheet({ store, onClose }) {
   const food = store.settings.food || { pouches: 0, alert_at: 5 };
   const [pouches, setPouches] = useState(Number(food.pouches) || 0);
@@ -1953,6 +2041,9 @@ function Main({ session }) {
         break;
       case "food":
         sheetEl = <FoodSheet store={store} onClose={close} />;
+        break;
+      case "treatment":
+        sheetEl = <TreatmentSheet store={store} kind={sheet.kind} onClose={close} />;
         break;
       default:
         sheetEl = null;
