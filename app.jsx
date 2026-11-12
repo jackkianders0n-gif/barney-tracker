@@ -543,7 +543,7 @@ const shareOf = (l) => { const p = l.details && l.details.portion; return p in P
 function foodStatus(data, at = new Date()) {
   const f = (data.settings && data.settings.food) || {};
   const mealG = Number(f.meal_g) || 90;
-  const bagG = Number(f.bag_g) || 2000;
+  const bagG = Number(f.bag_g) || 6000;
   const alertDays = f.alert_days != null ? Number(f.alert_days) : 5;
   const known = !!f.counted_at;
   const fed = data.logs.filter((l) => l.kind === "fed" && new Date(l.at) <= at);

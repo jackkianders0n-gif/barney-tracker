@@ -281,7 +281,7 @@ declare
   v jsonb;
   left_g numeric;
 begin
-  insert into public.bt_settings (key, value) values ('food', '{"meal_g":90,"bag_g":2000,"alert_days":5}'::jsonb)
+  insert into public.bt_settings (key, value) values ('food', '{"meal_g":90,"bag_g":6000,"alert_days":5}'::jsonb)
   on conflict (key) do nothing;
   if p_add is not null or p_set is not null then
     left_g := coalesce((public.bt_food_status(p_at)->>'left_g')::numeric, 0);
@@ -304,7 +304,7 @@ grant execute on function public.bt_food_update(numeric, numeric, timestamptz, i
 
 -- Starting values and private keys
 insert into public.bt_settings (key, value) values
-  ('food', '{"meal_g":90,"bag_g":2000,"alert_days":5}'::jsonb),
+  ('food', '{"meal_g":90,"bag_g":6000,"alert_days":5}'::jsonb),
   ('info', '{}'::jsonb),
   ('alexa_key', to_jsonb(replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '')))
 on conflict (key) do nothing;
@@ -312,8 +312,11 @@ on conflict (key) do nothing;
 -- From the old pouch counter: switch to kibble. How much is left isn't known
 -- until someone taps Bought food or says how full the bag is.
 update public.bt_settings
-   set value = jsonb_build_object('meal_g', 90, 'bag_g', 2000, 'alert_days', coalesce((value->>'alert_days')::int, 5))
+   set value = jsonb_build_object('meal_g', 90, 'bag_g', 6000, 'alert_days', coalesce((value->>'alert_days')::int, 5))
  where key = 'food' and not value ? 'meal_g';
+-- His bags are 6kg (an earlier draft of this said 2kg): fix it if no one has used it yet
+update public.bt_settings set value = value || '{"bag_g":6000}'::jsonb
+ where key = 'food' and (value->>'bag_g')::int = 2000 and not value ? 'grams';
 
 insert into public.bt_secrets (key, value) values
   ('fn_key', to_jsonb(replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '')))
