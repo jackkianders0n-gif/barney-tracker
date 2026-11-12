@@ -5,7 +5,8 @@
 // calendar, default name "Barney":
 // POST {"type":"plan"|"appt","id":"<id>"} → add, change or remove one event (database trigger)
 // POST {"type":"treat"}                   → move the flea and worming events (database trigger)
-// POST {"all": true}                      → bring the calendar in line with the app (Barney → Sync calendar now)
+// POST {"all": true}                      → bring the calendar in line with the app (Barney → Sync calendar now,
+//                                           and the database after a weekly plan is added, changed or stopped)
 // Results go into bt_settings as icloud_status.
 //
 // Needs "Verify JWT" turned OFF: the database can't sign in. Calls from the
@@ -62,7 +63,13 @@ Deno.serve(async (req: Request) => {
   try { body = await req.json(); } catch { /* empty body */ }
 
   if (body?.all) {
-    const result = await syncAll(admin);
+    const all = syncAll(admin);
+    // The database doesn't wait for an answer: reply at once and carry on in the background
+    if (fromDatabase && typeof EdgeRuntime !== "undefined" && EdgeRuntime?.waitUntil) {
+      EdgeRuntime.waitUntil(all);
+      return json({ ok: true }, 202);
+    }
+    const result = await all;
     return json(result, result.ok ? 200 : 400);
   }
   const treat = body?.type === "treat";

@@ -94,6 +94,31 @@ create table if not exists public.bt_plans (
 );
 create index if not exists bt_plans_day_idx on public.bt_plans (day);
 
+-- Weekly plans (daycare every Tuesday and Thursday, Mum's every Sunday…).
+-- The database adds each one's days to bt_plans 8 weeks ahead (bt_fill_repeats),
+-- so everything else just sees ordinary plans. weekdays: 1 = Monday … 7 = Sunday.
+-- A day someone deletes goes into skipped and isn't added again.
+create table if not exists public.bt_plan_repeats (
+  id          uuid primary key default gen_random_uuid(),
+  place       text not null check (place in ('home','mum','jakey','daycare','walk')),
+  weekdays    int[] not null check (cardinality(weekdays) > 0 and weekdays <@ array[1,2,3,4,5,6,7]),
+  all_day     boolean not null default false,
+  start_time  time,
+  end_time    time,
+  note        text not null default '',
+  starts_on   date not null default ((now() at time zone 'Europe/London')::date),
+  ends_on     date,
+  skipped     date[] not null default '{}',
+  created_by  uuid default auth.uid(),
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+-- Plans made from a weekly plan: which one, and the day it was for (kept if
+-- the plan is moved to another day, so it isn't added twice)
+alter table public.bt_plans add column if not exists repeat_id uuid;
+alter table public.bt_plans add column if not exists repeat_day date;
+create unique index if not exists bt_plans_repeat_idx on public.bt_plans (repeat_id, repeat_day);
+
 
 -- 4. Vet and grooming appointments (also go into the iCloud calendar)
 create table if not exists public.bt_appointments (
@@ -159,13 +184,16 @@ create trigger bt_plans_touch before update on public.bt_plans
 drop trigger if exists bt_appointments_touch on public.bt_appointments;
 create trigger bt_appointments_touch before update on public.bt_appointments
   for each row execute function public.bt_touch_updated_at();
+drop trigger if exists bt_plan_repeats_touch on public.bt_plan_repeats;
+create trigger bt_plan_repeats_touch before update on public.bt_plan_repeats
+  for each row execute function public.bt_touch_updated_at();
 
 
 -- 7. Access rules: members only, on every table
 do $$
 declare t text;
 begin
-  foreach t in array array['bt_log','bt_plans','bt_appointments','bt_settings','bt_push_subscriptions'] loop
+  foreach t in array array['bt_log','bt_plans','bt_plan_repeats','bt_appointments','bt_settings','bt_push_subscriptions'] loop
     execute format('alter table public.%I enable row level security', t);
     execute format('drop policy if exists "bt members only" on public.%I', t);
     execute format('create policy "bt members only" on public.%I for all to authenticated
@@ -179,7 +207,7 @@ do $$
 declare t text;
 begin
   if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
-    foreach t in array array['bt_log','bt_plans','bt_appointments','bt_settings','bt_push_subscriptions'] loop
+    foreach t in array array['bt_log','bt_plans','bt_plan_repeats','bt_appointments','bt_settings','bt_push_subscriptions'] loop
       begin
         execute format('alter publication supabase_realtime add table public.%I', t);
       exception when duplicate_object then null;  -- already added
@@ -278,6 +306,8 @@ as $$
 declare
   t text := case tg_table_name when 'bt_plans' then 'plan' else 'appt' end;
 begin
+  -- a weekly plan being rebuilt sends one full sync at the end instead
+  if coalesce(current_setting('bt.regen', true), '') = 'on' then return null; end if;
   if tg_op = 'DELETE' then
     perform public.bt_call('bt-calendar', jsonb_build_object('type', t, 'id', old.id));
   elsif not (tg_op = 'INSERT' and new.legacy_id is not null) then
@@ -331,6 +361,98 @@ create trigger bt_log_treatment_calendar after insert or update or delete on pub
 drop trigger if exists bt_settings_treatment_calendar on public.bt_settings;
 create trigger bt_settings_treatment_calendar after insert or update on public.bt_settings
   for each row execute function public.bt_treatment_calendar();
+
+-- Weekly plans: add their days as ordinary plans, 8 weeks ahead (each one
+-- goes into the calendar through bt_plans_calendar). Skipped days aren't added.
+create or replace function public.bt_fill_repeats(p_id uuid default null)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare today date := (now() at time zone 'Europe/London')::date;
+begin
+  insert into public.bt_plans (place, day, all_day, start_time, end_time, note, created_by, repeat_id, repeat_day)
+  select r.place, d::date, r.all_day, r.start_time, r.end_time, r.note, r.created_by, r.id, d::date
+    from public.bt_plan_repeats r
+   cross join lateral generate_series(greatest(r.starts_on, today), least(coalesce(r.ends_on, today + 56), today + 56), interval '1 day') d
+   where (p_id is null or r.id = p_id)
+     and extract(isodow from d)::int = any (r.weekdays)
+     and not (d::date = any (r.skipped))
+  on conflict (repeat_id, repeat_day) do nothing;
+end;
+$$;
+revoke all on function public.bt_fill_repeats(uuid) from public, anon, authenticated;
+
+-- A weekly plan added, changed or stopped: take its days from today on away
+-- and (unless stopped) add them again. The calendar gets one full sync after,
+-- rather than an update for every day.
+create or replace function public.bt_repeat_changed()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if tg_op = 'UPDATE'
+     and (new.place, new.weekdays, new.all_day, new.start_time, new.end_time, new.note, new.starts_on, new.ends_on)
+         is not distinct from
+         (old.place, old.weekdays, old.all_day, old.start_time, old.end_time, old.note, old.starts_on, old.ends_on) then
+    return null;  -- only the skipped days changed
+  end if;
+  perform set_config('bt.regen', 'on', true);  -- not skipped days, no calendar call each
+  if tg_op <> 'INSERT' then
+    delete from public.bt_plans where repeat_id = old.id and day >= (now() at time zone 'Europe/London')::date;
+  end if;
+  if tg_op <> 'DELETE' then
+    perform public.bt_fill_repeats(new.id);
+  end if;
+  perform set_config('bt.regen', 'off', true);
+  perform public.bt_call('bt-calendar', jsonb_build_object('all', true));
+  if tg_op = 'DELETE' then return old; end if;
+  return null;
+end;
+$$;
+revoke all on function public.bt_repeat_changed() from public;
+
+drop trigger if exists bt_plan_repeats_changed on public.bt_plan_repeats;
+create trigger bt_plan_repeats_changed after insert or update on public.bt_plan_repeats
+  for each row execute function public.bt_repeat_changed();
+drop trigger if exists bt_plan_repeats_stopped on public.bt_plan_repeats;
+create trigger bt_plan_repeats_stopped before delete on public.bt_plan_repeats
+  for each row execute function public.bt_repeat_changed();
+
+-- Someone deleted one day of a weekly plan (a bank holiday, say): remember it
+create or replace function public.bt_plan_skipped()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if old.repeat_id is not null
+     and coalesce(current_setting('bt.regen', true), '') <> 'on'
+     and old.repeat_day >= (now() at time zone 'Europe/London')::date then
+    update public.bt_plan_repeats set skipped = array_append(skipped, old.repeat_day)
+     where id = old.repeat_id and not (old.repeat_day = any (skipped));
+  end if;
+  return null;
+end;
+$$;
+revoke all on function public.bt_plan_skipped() from public;
+
+drop trigger if exists bt_plans_skipped on public.bt_plans;
+create trigger bt_plans_skipped after delete on public.bt_plans
+  for each row execute function public.bt_plan_skipped();
+
+-- Every night, add the next day of each weekly plan
+do $$
+begin
+  if exists (select 1 from cron.job where jobname = 'bt-repeats') then
+    perform cron.unschedule('bt-repeats');
+  end if;
+  perform cron.schedule('bt-repeats', '15 1 * * *', 'select public.bt_fill_repeats()');
+end $$;
 
 -- Reminders: every hour, bt-push checks the UK time and sends the 8am, 12pm,
 -- 4pm and 6pm reminders when they're due (so it's right in summer and winter).

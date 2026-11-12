@@ -10,7 +10,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 // ---------------------------------------------------------------------------
 const SUPABASE_URL = "https://wvedhcuebfdfkhfvphlb.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_bkeGnvruQEz3MsVDZiJ03g_bhXXDjgC";
-const APP_VERSION = "2.1.1";
+const APP_VERSION = "2.2.0";
 // The old Cloudflare app, read once by Barney → Settings → Bring over data from the old app
 const OLD_API = "https://barney-tracker-api.barneythebigdog.workers.dev";
 
@@ -63,6 +63,8 @@ const PLACES = [
   { key: "walk",    label: "Out on a walk", now: "Out on a walk",     icon: "lead",       color: "#A2652A" },
 ];
 const PLACE = Object.fromEntries(PLACES.map((p) => [p.key, p]));
+// For weekly plans: 1 = Monday … 7 = Sunday, as the database counts them
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((label, i) => ({ key: i + 1, label }));
 
 const PORTIONS = [
   { key: "full", label: "Full portion" },
@@ -280,8 +282,8 @@ function Toasts() {
 // ---------------------------------------------------------------------------
 const CACHE_KEY = "bt-cache-v1";
 const QUEUE_KEY = "bt-queue-v1";
-const LIVE_TABLES = ["bt_log", "bt_plans", "bt_appointments", "bt_settings", "bt_push_subscriptions"];
-const EMPTY = { logs: [], plans: [], appts: [], settings: {}, subs: [], names: {} };
+const LIVE_TABLES = ["bt_log", "bt_plans", "bt_plan_repeats", "bt_appointments", "bt_settings", "bt_push_subscriptions"];
+const EMPTY = { logs: [], plans: [], repeats: [], appts: [], settings: {}, subs: [], names: {} };
 
 // Apply one outbox entry to a copy of the data
 function applyOp(state, q) {
@@ -344,6 +346,7 @@ function useBarney(userId) {
         sb.from("bt_settings").select("key, value"),
         sb.from("bt_push_subscriptions").select("id, endpoint, device_name, user_id, created_at").order("created_at"),
         sb.rpc("bt_member_names"),
+        sb.from("bt_plan_repeats").select("*").order("created_at"),
       ]);
     } catch (e) {
       if (isNetworkError(e)) setOffline(true); else console.error(e);
@@ -355,12 +358,13 @@ function useBarney(userId) {
       else { console.error(failed.error); setLoadError(failed.error.message || String(failed.error)); }
       return;
     }
-    const [logs, weights, treats, plans, appts, settings, subs, names] = res.map((r) => r.data || []);
+    const [logs, weights, treats, plans, appts, settings, subs, names, repeats] = res.map((r) => r.data || []);
     const byId = new Map();
     [...logs, ...weights, ...treats].forEach((l) => byId.set(l.id, l));
     const next = {
       logs: [...byId.values()].sort(byAtDesc),
       plans,
+      repeats,
       appts,
       settings: Object.fromEntries(settings.map((s) => [s.key, s.value])),
       subs,
@@ -497,6 +501,8 @@ function useBarney(userId) {
     food: (args) => commit({ op: "food", args }),
     savePlan: (id, row) => online(() => (id ? sb.from("bt_plans").update(row).eq("id", id) : sb.from("bt_plans").insert(row)), "Plan saved"),
     deletePlan: (id) => online(() => sb.from("bt_plans").delete().eq("id", id), "Plan removed"),
+    saveRepeat: (id, row) => online(() => (id ? sb.from("bt_plan_repeats").update(row).eq("id", id) : sb.from("bt_plan_repeats").insert(row)), "Weekly plan saved"),
+    deleteRepeat: (id) => online(() => sb.from("bt_plan_repeats").delete().eq("id", id), "Weekly plan stopped"),
     saveAppt: (id, row) => online(() => (id ? sb.from("bt_appointments").update(row).eq("id", id) : sb.from("bt_appointments").insert(row)), "Appointment saved"),
     deleteAppt: (id) => online(() => sb.from("bt_appointments").delete().eq("id", id), "Appointment removed"),
     setSetting,
@@ -525,7 +531,17 @@ function planSpan(p) {
   return [s, e];
 }
 const planOrder = (a, b) => (a.all_day === b.all_day ? (a.start_time || "").localeCompare(b.start_time || "") : a.all_day ? -1 : 1);
-const planTimes = (p) => (p.all_day || !p.start_time ? "All day" : `${clockOf(p.start_time)} to ${clockOf(p.end_time) || clock(planSpan(p)[1])}`);
+const planTimes = (p) => (p.all_day || !p.start_time ? "All day" : `${clockOf(p.start_time)} to ${clockOf(p.end_time) || clock(planSpan({ day: todayKey(), ...p })[1])}`);
+const isoDay = (d) => ((d.getDay() + 6) % 7) + 1;
+const listText = (xs) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
+function repeatDays(r) {
+  const w = [...r.weekdays].sort((a, b) => a - b);
+  if (w.length === 7) return "Every day";
+  if (w.join() === "1,2,3,4,5") return "Every weekday";
+  if (w.join() === "6,7") return "Every weekend";
+  return `Every ${listText(w.map((n) => WEEKDAYS[n - 1].label))}`;
+}
+const repeatOf = (store, plan) => (plan && plan.repeat_id && (store.repeats || []).find((r) => r.id === plan.repeat_id)) || null;
 
 // Where Barney is, from today's plans
 function whereNow(plans) {
@@ -1110,7 +1126,7 @@ function PlansWeek({ store, open }) {
                   <span className="place-icon" style={{ color: pl.color }}><Icon name={pl.icon} size={22} /></span>
                   <span className="log-main">
                     <span className="log-title">{pl.label}</span>
-                    <span className="log-sub">{[planTimes(p), p.note].filter(Boolean).join(". ")}</span>
+                    <span className="log-sub">{[planTimes(p), repeatOf(store, p) && "Every week", p.note].filter(Boolean).join(". ")}</span>
                   </span>
                   <Icon name="chevronRight" size={20} className="row-chevron" />
                 </button>
@@ -1299,6 +1315,29 @@ function BarneyScreen({ store, open, photo, sub, session }) {
         <h2>Where he'll be</h2>
         <p className="block-note">Plans go into the shared Barney calendar in iCloud too.</p>
         <PlansWeek store={store} open={open} />
+        <div className="block-head repeats-head">
+          <h3>Every week</h3>
+          <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "plan", weekly: true })}><Icon name="plus" size={18} /> Add</button>
+        </div>
+        {(store.repeats || []).length === 0 ? <Empty>Nothing repeats yet. Add daycare days once and they fill in every week.</Empty> : (
+          <ul className="list">
+            {store.repeats.map((r) => {
+              const pl = PLACE[r.place] || PLACES[0];
+              return (
+                <li key={r.id}>
+                  <button type="button" className="log-row" onClick={() => open({ type: "plan", repeat: r })}>
+                    <span className="place-icon" style={{ color: pl.color }}><Icon name={pl.icon} size={22} /></span>
+                    <span className="log-main">
+                      <span className="log-title">{pl.label}</span>
+                      <span className="log-sub">{[repeatDays(r), planTimes(r), r.ends_on && `until ${shortDate(parseDay(r.ends_on))}`, r.note].filter(Boolean).join(". ")}</span>
+                    </span>
+                    <Icon name="chevronRight" size={20} className="row-chevron" />
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
       </section>
 
       <section className="block" id="details">
@@ -1665,26 +1704,58 @@ function AddSheet({ onClose, pick }) {
   );
 }
 
-function PlanSheet({ store, plan, day, onClose }) {
-  const [place, setPlace] = useState((plan && plan.place) || "home");
-  const [date, setDate] = useState((plan && plan.day) || day || todayKey());
-  const [allDay, setAllDay] = useState(plan ? !!plan.all_day : false);
-  const [start, setStart] = useState((plan && plan.start_time && plan.start_time.slice(0, 5)) || "09:00");
-  const [end, setEnd] = useState((plan && plan.end_time && plan.end_time.slice(0, 5)) || "17:00");
-  const [note, setNote] = useState((plan && plan.note) || "");
+function PlanSheet({ store, plan, repeat, day, weekly, onClose, openRepeat }) {
+  const src = repeat || plan;
+  const linked = repeatOf(store, plan);
+  const [place, setPlace] = useState((src && src.place) || "home");
+  const [date, setDate] = useState((plan && plan.day) || (repeat && repeat.starts_on) || day || todayKey());
+  const [allDay, setAllDay] = useState(src ? !!src.all_day : false);
+  const [start, setStart] = useState((src && src.start_time && src.start_time.slice(0, 5)) || "09:00");
+  const [end, setEnd] = useState((src && src.end_time && src.end_time.slice(0, 5)) || "17:00");
+  const [note, setNote] = useState((src && src.note) || "");
+  const [repeating, setRepeating] = useState(!!repeat || !!weekly);
+  const [weekdays, setWeekdays] = useState(() => (repeat ? [...repeat.weekdays] : weekly ? [isoDay(parseDay(day || todayKey()))] : []));
+  const [until, setUntil] = useState((repeat && repeat.ends_on) || "");
   const [busy, setBusy] = useState(false);
+
+  const turnRepeat = (on) => {
+    setRepeating(on);
+    if (on && !weekdays.length) setWeekdays([isoDay(parseDay(date))]);
+  };
+  const toggleDay = (n) => setWeekdays((w) => (w.includes(n) ? w.filter((x) => x !== n) : [...w, n].sort((a, b) => a - b)));
+
   const save = async (e) => {
     e.preventDefault();
     if (!allDay && end <= start) { toast("The end time needs to be after the start.", "error"); return; }
+    const times = { all_day: allDay, start_time: allDay ? null : start, end_time: allDay ? null : end, note: note.trim() };
     setBusy(true);
-    const ok = await store.savePlan(plan && plan.id, { place, day: date, all_day: allDay, start_time: allDay ? null : start, end_time: allDay ? null : end, note: note.trim() });
+    let ok;
+    if (repeating) {
+      if (!weekdays.length) { setBusy(false); toast("Pick at least one day of the week.", "error"); return; }
+      if (until && until < date) { setBusy(false); toast("The last day needs to be after the first.", "error"); return; }
+      ok = await store.saveRepeat(repeat && repeat.id, { place, weekdays, starts_on: date, ends_on: until || null, ...times });
+    } else {
+      ok = await store.savePlan(plan && plan.id, { place, day: date, ...times });
+    }
     setBusy(false);
     if (ok) onClose();
   };
-  const remove = async () => { setBusy(true); const ok = await store.deletePlan(plan.id); setBusy(false); if (ok) onClose(); };
+  const remove = async () => {
+    setBusy(true);
+    const ok = repeat ? await store.deleteRepeat(repeat.id) : await store.deletePlan(plan.id);
+    setBusy(false);
+    if (ok) onClose();
+  };
+
   return (
-    <Sheet title={plan ? "Change plan" : "Where will Barney be?"} onClose={onClose}>
+    <Sheet title={repeat ? "Weekly plan" : plan ? "Change plan" : "Where will Barney be?"} onClose={onClose}>
       <form className="sheet-body" onSubmit={save}>
+        {linked && (
+          <div className="repeat-note">
+            <p>Part of {PLACE[linked.place] ? PLACE[linked.place].label : "a weekly plan"}, e{repeatDays(linked).slice(1)}. Changes here are just for this day.</p>
+            <button type="button" className="btn btn-small btn-outline" onClick={() => openRepeat(linked)}>Change every week</button>
+          </div>
+        )}
         <div className="field">
           <span className="field-label" id="lbl-place">Place</span>
           <div className="places" role="radiogroup" aria-labelledby="lbl-place">
@@ -1695,7 +1766,31 @@ function PlanSheet({ store, plan, day, onClose }) {
             ))}
           </div>
         </div>
-        <Field label="Day" id="plan-day"><input id="plan-day" className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} required /></Field>
+        {!plan && !repeat && (
+          <label className="toggle">
+            <input type="checkbox" checked={repeating} onChange={(e) => turnRepeat(e.target.checked)} />
+            <span className="toggle-ui" aria-hidden="true" />
+            <span>Every week</span>
+          </label>
+        )}
+        {repeating && (
+          <div className="field">
+            <span className="field-label" id="lbl-weekdays">On</span>
+            <div className="choices weekdays" role="group" aria-labelledby="lbl-weekdays">
+              {WEEKDAYS.map((w) => (
+                <button key={w.key} type="button" aria-pressed={weekdays.includes(w.key)} className={`choice ${weekdays.includes(w.key) ? "is-on" : ""}`} onClick={() => toggleDay(w.key)}>{w.label}</button>
+              ))}
+            </div>
+          </div>
+        )}
+        {repeating ? (
+          <div className="two">
+            <Field label="Starting" id="plan-day"><input id="plan-day" className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} required /></Field>
+            <Field label="Until (optional)" id="plan-until"><input id="plan-until" className="input" type="date" value={until} min={date} onChange={(e) => setUntil(e.target.value)} /></Field>
+          </div>
+        ) : (
+          <Field label="Day" id="plan-day"><input id="plan-day" className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} required /></Field>
+        )}
         <label className="toggle">
           <input type="checkbox" checked={allDay} onChange={(e) => setAllDay(e.target.checked)} />
           <span className="toggle-ui" aria-hidden="true" />
@@ -1708,8 +1803,10 @@ function PlanSheet({ store, plan, day, onClose }) {
           </div>
         )}
         <Field label="Note (optional)" id="plan-note"><input id="plan-note" className="input" value={note} onChange={(e) => setNote(e.target.value)} placeholder="For example, Jakey dropping him off" /></Field>
-        <button type="submit" className="btn btn-primary btn-block" disabled={busy}>{plan ? "Save changes" : "Save plan"}</button>
-        {plan && <ConfirmButton label="Delete plan" confirmLabel="Tap again to delete" onConfirm={remove} />}
+        {repeating && <p className="field-hint">Each day is added to the plans and the calendar, 8 weeks ahead. Delete a single day (a bank holiday, say) and it stays off.</p>}
+        <button type="submit" className="btn btn-primary btn-block" disabled={busy}>{plan || repeat ? "Save changes" : repeating ? "Save weekly plan" : "Save plan"}</button>
+        {plan && <ConfirmButton label={linked ? "Delete this day only" : "Delete plan"} confirmLabel="Tap again to delete" onConfirm={remove} />}
+        {repeat && <ConfirmButton label="Stop this weekly plan" confirmLabel="Tap again: removes the days ahead" onConfirm={remove} />}
       </form>
     </Sheet>
   );
@@ -2031,7 +2128,8 @@ function Main({ session }) {
         sheetEl = <AddSheet onClose={close} pick={(kind) => setSheet({ type: "log", kind })} />;
         break;
       case "plan":
-        sheetEl = <PlanSheet store={store} plan={sheet.plan} day={sheet.day} onClose={close} />;
+        sheetEl = <PlanSheet key={sheet.repeat ? `r-${sheet.repeat.id}` : (sheet.plan && sheet.plan.id) || "new"} store={store} plan={sheet.plan} repeat={sheet.repeat} day={sheet.day} weekly={sheet.weekly}
+          onClose={close} openRepeat={(r) => setSheet({ type: "plan", repeat: r })} />;
         break;
       case "appt":
         sheetEl = <ApptSheet store={store} appt={sheet.appt} onClose={close} />;
