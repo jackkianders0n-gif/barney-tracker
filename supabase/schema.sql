@@ -62,7 +62,7 @@ create table if not exists public.bt_log (
                 'flea','worm','weight','med','behaviour','grooming')),
   at          timestamptz not null default now(),
   details     jsonb not null default '{}'::jsonb,
-  -- fed:       { portion: full|half|treat, eaten: 0–100 }
+  -- fed:       { portion: full|half|treat, eaten: 0–100, or null until someone says }
   -- walk:      { mins, distance }
   -- weight:    { kg }
   -- med:       { name, dose }
@@ -116,6 +116,9 @@ create table if not exists public.bt_plan_repeats (
 -- Plans made from a weekly plan: which one, and the day it was for (kept if
 -- the plan is moved to another day, so it isn't added twice)
 alter table public.bt_plans add column if not exists repeat_id uuid;
+-- Which daycare (an id from bt_settings.daycares) when place = 'daycare'; null = not said
+alter table public.bt_plans add column if not exists daycare text;
+alter table public.bt_plan_repeats add column if not exists daycare text;
 alter table public.bt_plans add column if not exists repeat_day date;
 create unique index if not exists bt_plans_repeat_idx on public.bt_plans (repeat_id, repeat_day);
 
@@ -221,8 +224,9 @@ begin
 end $$;
 
 -- Food: Barney's kibble, in grams. { grams, counted_at, meal_g, bag_g, alert_days }:
--- grams is how much there was at counted_at; what's left now is that minus the
--- meals logged since (full portion = meal_g, half = half that, treat only = 0).
+-- grams is how much there was at counted_at; what's left now is that minus what
+-- he ate of the meals logged since (full portion = meal_g, half = half that,
+-- treat only = 0; times how much he ate, all of it until someone says).
 -- The app works it out the same way (foodStatus in app.jsx); bt-push and
 -- bt-alexa call this.
 create or replace function public.bt_food_status(p_at timestamptz default now())
@@ -236,13 +240,13 @@ as $$
     select value, coalesce((value->>'meal_g')::numeric, 90) as meal_g from public.bt_settings where key = 'food'
   ), used as (
     select f.meal_g * coalesce((
-             select sum(case l.details->>'portion' when 'half' then 0.5 when 'treat' then 0 else 1 end)
+             select sum((case l.details->>'portion' when 'half' then 0.5 when 'treat' then 0 else 1 end) * coalesce((l.details->>'eaten')::numeric, 100) / 100)
                from public.bt_log l
               where l.kind = 'fed' and l.at > (f.value->>'counted_at')::timestamptz and l.at <= p_at), 0) as g
       from f
   ), recent as (  -- grams a day over the last fortnight (two meals a day until there's enough to go on)
     select count(*) as meals,
-           coalesce(sum(case l.details->>'portion' when 'half' then 0.5 when 'treat' then 0 else 1 end), 0) as portions,
+           coalesce(sum((case l.details->>'portion' when 'half' then 0.5 when 'treat' then 0 else 1 end) * coalesce((l.details->>'eaten')::numeric, 100) / 100), 0) as portions,
            min(l.at) as first_at
       from public.bt_log l
      where l.kind = 'fed' and l.at > p_at - interval '14 days' and l.at <= p_at
@@ -306,7 +310,9 @@ grant execute on function public.bt_food_update(numeric, numeric, timestamptz, i
 insert into public.bt_settings (key, value) values
   ('food', '{"meal_g":90,"bag_g":6000,"alert_days":5}'::jsonb),
   ('info', '{}'::jsonb),
-  ('alexa_key', to_jsonb(replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '')))
+  ('alexa_key', to_jsonb(replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', ''))),
+  -- His daycares (editable in Barney → Settings → Daycares)
+  ('daycares', '[{"id":"bruces","name":"Bruce''s"},{"id":"unleashed","name":"Unleashed"},{"id":"wendys","name":"Wendy''s"}]'::jsonb)
 on conflict (key) do nothing;
 
 -- From the old pouch counter: switch to kibble. How much is left isn't known
@@ -347,6 +353,7 @@ revoke all on function public.bt_call(text, jsonb) from public, anon, authentica
 
 -- A notification when someone logs a meal, water, wee, poo, walk or daycare day.
 -- (Not for rows brought over from the old app, or for logs more than 6 hours old.)
+-- And one when a meal that was put down is marked as not eaten at all.
 create or replace function public.bt_log_notify()
 returns trigger
 language plpgsql
@@ -354,10 +361,16 @@ security definer
 set search_path = public
 as $$
 begin
-  if new.legacy_id is null
-     and new.kind in ('fed','water','wee','poo','walk','daycare')
-     and new.at > now() - interval '6 hours' then
-    perform public.bt_call('bt-push', jsonb_build_object('action', 'log', 'id', new.id));
+  if tg_op = 'INSERT' then
+    if new.legacy_id is null
+       and new.kind in ('fed','water','wee','poo','walk','daycare')
+       and new.at > now() - interval '6 hours' then
+      perform public.bt_call('bt-push', jsonb_build_object('action', 'log', 'id', new.id));
+    end if;
+  elsif new.kind = 'fed'
+        and old.details->>'eaten' is distinct from '0' and new.details->>'eaten' = '0'
+        and new.at > now() - interval '12 hours' then
+    perform public.bt_call('bt-push', jsonb_build_object('action', 'refused', 'id', new.id, 'by', auth.uid()));
   end if;
   return null;
 end;
@@ -365,7 +378,7 @@ $$;
 revoke all on function public.bt_log_notify() from public;
 
 drop trigger if exists bt_log_notify on public.bt_log;
-create trigger bt_log_notify after insert on public.bt_log
+create trigger bt_log_notify after insert or update on public.bt_log
   for each row execute function public.bt_log_notify();
 
 -- Plans and appointments go into the shared iCloud calendar
@@ -399,7 +412,8 @@ create trigger bt_appointments_calendar after insert or update or delete on publ
   for each row execute function public.bt_calendar_notify();
 
 -- When flea and worming are next due also goes into the calendar: it moves when
--- a dose is logged, changed or removed, or the due date or how often is changed
+-- a dose is logged, changed or removed, or the due date or how often is changed.
+-- (Also: the daycares list changing re-sends every plan, so names stay right.)
 create or replace function public.bt_treatment_calendar()
 returns trigger
 language plpgsql
@@ -409,6 +423,10 @@ as $$
 declare hit boolean := false;
 begin
   if tg_table_name = 'bt_settings' then
+    if new.key = 'daycares' then  -- a daycare renamed: its plans' events say the new name
+      perform public.bt_call('bt-calendar', jsonb_build_object('all', true));
+      return null;
+    end if;
     hit := new.key = 'treatments';
   else
     if tg_op <> 'DELETE' then
@@ -444,8 +462,8 @@ set search_path = public
 as $$
 declare today date := (now() at time zone 'Europe/London')::date;
 begin
-  insert into public.bt_plans (place, day, all_day, start_time, end_time, note, created_by, repeat_id, repeat_day)
-  select r.place, d::date, r.all_day, r.start_time, r.end_time, r.note, r.created_by, r.id, d::date
+  insert into public.bt_plans (place, daycare, day, all_day, start_time, end_time, note, created_by, repeat_id, repeat_day)
+  select r.place, r.daycare, d::date, r.all_day, r.start_time, r.end_time, r.note, r.created_by, r.id, d::date
     from public.bt_plan_repeats r
    cross join lateral generate_series(greatest(r.starts_on, today), least(coalesce(r.ends_on, today + 56), today + 56), interval '1 day') d
    where (p_id is null or r.id = p_id)
@@ -467,9 +485,9 @@ set search_path = public
 as $$
 begin
   if tg_op = 'UPDATE'
-     and (new.place, new.weekdays, new.all_day, new.start_time, new.end_time, new.note, new.starts_on, new.ends_on)
+     and (new.place, new.daycare, new.weekdays, new.all_day, new.start_time, new.end_time, new.note, new.starts_on, new.ends_on)
          is not distinct from
-         (old.place, old.weekdays, old.all_day, old.start_time, old.end_time, old.note, old.starts_on, old.ends_on) then
+         (old.place, old.daycare, old.weekdays, old.all_day, old.start_time, old.end_time, old.note, old.starts_on, old.ends_on) then
     return null;  -- only the skipped days changed
   end if;
   perform set_config('bt.regen', 'on', true);  -- not skipped days, no calendar call each

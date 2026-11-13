@@ -181,9 +181,15 @@ async function syncAll(admin: Admin) {
   }
 }
 
+// Member names by user id, plus daycare names under "daycare:<id>"
 async function names(admin: Admin): Promise<Record<string, string>> {
-  const { data } = await admin.from("bt_members").select("user_id, display_name");
-  return Object.fromEntries((data ?? []).map((m: any) => [m.user_id, m.display_name]));
+  const [{ data }, { data: daycares }] = await Promise.all([
+    admin.from("bt_members").select("user_id, display_name"),
+    admin.from("bt_settings").select("value").eq("key", "daycares").maybeSingle(),
+  ]);
+  const out: Record<string, string> = Object.fromEntries((data ?? []).map((m: any) => [m.user_id, m.display_name]));
+  if (Array.isArray(daycares?.value)) for (const d of daycares.value) if (d?.id && d?.name) out[`daycare:${d.id}`] = d.name;
+  return out;
 }
 
 function messageOf(e: unknown): string {
@@ -312,7 +318,8 @@ function buildEvent(kind: Kind, row: any, who: Record<string, string>): string {
 
   const by = row.created_by && who[row.created_by] ? `Added by ${who[row.created_by]}` : null;
   if (kind === "plan") {
-    lines.push(`SUMMARY:${escapeText(`Barney ${PLACES[row.place] ?? row.place}`)}`);
+    const where = row.place === "daycare" && row.daycare && who[`daycare:${row.daycare}`] ? `at ${who[`daycare:${row.daycare}`]}` : PLACES[row.place] ?? row.place;
+    lines.push(`SUMMARY:${escapeText(`Barney ${where}`)}`);
     const desc = [row.note, by].filter(Boolean).join("\n");
     if (desc) lines.push(`DESCRIPTION:${escapeText(desc)}`);
   } else {

@@ -4,6 +4,7 @@
 // POST {"action":"test"}             → a test notification to your own phones (members)
 // POST {"action":"log","id":"<id>"}  → tell everyone else about a new log (database trigger),
 //                                      on the phones that chose to hear about that kind
+// POST {"action":"refused","id":"<id>","by":"<user>"} → a meal marked as not eaten (database trigger)
 // POST {"action":"check"}            → the 8am / 12pm / 4pm / 6pm reminders (hourly cron job)
 //
 // Needs "Verify JWT" turned OFF: the database can't sign in. Calls from the
@@ -82,6 +83,17 @@ Deno.serve(async (req: Request) => {
         return json(await work);
       }
 
+      case "refused": {
+        if (!fromDatabase) return json({ error: "Not allowed" }, 403);
+        if (typeof body.id !== "string") return json({ error: "Missing id" }, 400);
+        const work = sendRefused(admin, body.id, typeof body.by === "string" ? body.by : null);
+        if (typeof EdgeRuntime !== "undefined" && EdgeRuntime?.waitUntil) {
+          EdgeRuntime.waitUntil(work);
+          return json({ ok: true }, 202);
+        }
+        return json(await work);
+      }
+
       case "check": {
         if (!fromDatabase) return json({ error: "Not allowed" }, 403);
         return json(await runReminders(admin, typeof body.hour === "number" ? body.hour : null));
@@ -133,13 +145,44 @@ async function sendLog(admin: Admin, id: string) {
   const { data: log } = await admin.from("bt_log").select("*").eq("id", id).maybeSingle();
   if (!log) return { sent: 0, skipped: "undone" };
   const name = log.created_by ? await memberName(admin, log.created_by) : null;
-  const msg = logMessage(log, name);
+  const msg = logMessage(log, name, log.kind === "daycare" ? await daycareName(admin, log.details?.daycare) : null);
   if (!msg) return { sent: 0 };
   const { data: subs } = await admin.from("bt_push_subscriptions").select("*");
   // Everyone except the person who logged it
   const group = LOG_GROUP[log.kind];
   const targets = (subs ?? []).filter((s: any) => (!log.created_by || s.user_id !== log.created_by) && wants(s, group));
   return await sendToAll(admin, targets, msg);
+}
+
+// A meal someone put down has been marked as not eaten at all: tell everyone else.
+// Waits like sendLog, so changing it straight back cancels it.
+async function sendRefused(admin: Admin, id: string, by: string | null) {
+  await new Promise((r) => setTimeout(r, LOG_DELAY_MS));
+  const { data: log } = await admin.from("bt_log").select("*").eq("id", id).maybeSingle();
+  if (!log || log.kind !== "fed" || Number(log.details?.eaten) !== 0 || log.details?.eaten == null) return { sent: 0, skipped: "changed" };
+  const name = by ? await memberName(admin, by) : null;
+  const msg: Message = {
+    title: `Barney didn't eat his ${mealName(new Date(log.at))}`,
+    body: `It went down at ${clock(new Date(log.at))}.${name ? ` Marked by ${name}.` : ""}`,
+    tag: `fed-${id}`,
+    group: "fed",
+  };
+  const { data: subs } = await admin.from("bt_push_subscriptions").select("*");
+  const targets = (subs ?? []).filter((s: any) => (!by || s.user_id !== by) && wants(s, "fed"));
+  return await sendToAll(admin, targets, msg);
+}
+
+// breakfast before 11am UK time, dinner from 3pm, lunch in between
+function mealName(at: Date): string {
+  const h = londonParts(at).hour;
+  return h < 11 ? "breakfast" : h >= 15 ? "dinner" : "lunch";
+}
+
+async function daycareName(admin: Admin, id: unknown): Promise<string | null> {
+  if (typeof id !== "string") return null;
+  const { data } = await admin.from("bt_settings").select("value").eq("key", "daycares").maybeSingle();
+  const found = Array.isArray(data?.value) ? data.value.find((d: any) => d?.id === id) : null;
+  return found?.name ?? null;
 }
 
 async function memberName(admin: Admin, userId: string): Promise<string | null> {
@@ -149,15 +192,18 @@ async function memberName(admin: Admin, userId: string): Promise<string | null> 
 
 const PORTION: Record<string, string> = { full: "Full portion", half: "Half portion", treat: "Treat only" };
 
-function logMessage(log: any, name: string | null): Message | null {
+function logMessage(log: any, name: string | null, daycare: string | null = null): Message | null {
   const d = log.details ?? {};
   const late = Date.now() - new Date(log.at).getTime() > 20 * 60 * 1000 ? ` at ${clock(new Date(log.at))}` : "";
   const by = name ? `Logged by ${name}${late}.` : `Logged${late}.`;
   switch (log.kind) {
     case "fed": {
-      const eaten = typeof d.eaten === "number" ? (d.eaten >= 100 ? "ate it all" : d.eaten <= 0 ? "didn't eat it" : `ate ${d.eaten}%`) : null;
-      const what = [PORTION[d.portion] ?? "A meal", eaten].filter(Boolean).join(", ");
-      return { title: "Barney's been fed", body: `${what}. ${by}`, tag: "fed" };
+      // Logged when the bowl goes down; how much he ate is ticked later (null until then)
+      if (typeof d.eaten !== "number") {
+        return { title: `Barney's ${mealName(new Date(log.at))} is down`, body: `${PORTION[d.portion] ?? "A meal"}. ${by}`, tag: "fed" };
+      }
+      const eaten = d.eaten >= 100 ? "ate it all" : d.eaten <= 0 ? "didn't eat it" : `ate ${d.eaten}%`;
+      return { title: "Barney's been fed", body: `${PORTION[d.portion] ?? "A meal"}, ${eaten}. ${by}`, tag: "fed" };
     }
     case "water": return { title: "Barney's water is topped up", body: by, tag: "water" };
     case "wee": return { title: "Barney's had a wee", body: by, tag: "toilet" };
@@ -166,7 +212,7 @@ function logMessage(log: any, name: string | null): Message | null {
       const mins = d.mins ? `${d.mins} minutes` : "A walk";
       return { title: "Barney's been for a walk", body: `${mins}${name ? ` with ${name}` : ""}${late}.`, tag: "walk" };
     }
-    case "daycare": return { title: "Barney's at doggy daycare", body: by, tag: "walk" };
+    case "daycare": return { title: daycare ? `Barney's at ${daycare}` : "Barney's at doggy daycare", body: by, tag: "walk" };
     default: return null;
   }
 }

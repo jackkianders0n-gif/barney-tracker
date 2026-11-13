@@ -10,7 +10,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 // ---------------------------------------------------------------------------
 const SUPABASE_URL = "https://wvedhcuebfdfkhfvphlb.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_bkeGnvruQEz3MsVDZiJ03g_bhXXDjgC";
-const APP_VERSION = "2.2.0";
+const APP_VERSION = "2.3.0";
 // The old Cloudflare app, read once by Barney → Settings → Bring over data from the old app
 const OLD_API = "https://barney-tracker-api.barneythebigdog.workers.dev";
 
@@ -63,6 +63,17 @@ const PLACES = [
   { key: "walk",    label: "Out on a walk", now: "Out on a walk",     icon: "lead",       color: "#A2652A" },
 ];
 const PLACE = Object.fromEntries(PLACES.map((p) => [p.key, p]));
+// His daycares (bt_settings.daycares, editable in Barney → Settings). A plan at
+// daycare keeps place "daycare" and says which in its daycare column.
+const DEFAULT_DAYCARES = [{ id: "bruces", name: "Bruce's" }, { id: "unleashed", name: "Unleashed" }, { id: "wendys", name: "Wendy's" }];
+const daycaresOf = (store) => (Array.isArray(store.settings.daycares) ? store.settings.daycares : DEFAULT_DAYCARES);
+const daycareName = (store, id) => { const d = id && daycaresOf(store).find((x) => x.id === id); return d ? d.name : null; };
+// A plan's place to show: the daycare's own name when it has one
+function placeOf(store, row) {
+  const base = PLACE[row.place] || PLACES[0];
+  const name = row.place === "daycare" ? daycareName(store, row.daycare) : null;
+  return name ? { ...base, label: name, now: `At ${name}` } : base;
+}
 // For weekly plans: 1 = Monday … 7 = Sunday, as the database counts them
 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((label, i) => ({ key: i + 1, label }));
 
@@ -72,6 +83,7 @@ const PORTIONS = [
   { key: "treat", label: "Treat only" },
 ];
 const PORTION_LABEL = Object.fromEntries(PORTIONS.map((p) => [p.key, p.label]));
+// Meals are logged when the bowl goes down; eaten stays null until someone ticks it
 const EATEN = [
   { key: 100, label: "All of it" },
   { key: 75, label: "Most" },
@@ -170,7 +182,7 @@ const lowerAgo = (iso) => (ago(iso) || "").replace(/^(Just|Yesterday|An)\b/, (w)
 const toLocalInput = (d) => `${dayKey(d)}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 
 function eatenText(e) {
-  if (typeof e !== "number") return null;
+  if (typeof e !== "number") return "Not ticked yet";
   if (e >= 100) return "Ate it all";
   if (e >= 75) return "Ate most of it";
   if (e >= 50) return "Ate half";
@@ -178,8 +190,11 @@ function eatenText(e) {
   return "Didn't eat it";
 }
 
+// Breakfast before 11am, dinner from 3pm, lunch in between (as bt-push says it)
+const mealName = (at) => { const h = new Date(at).getHours(); return h < 11 ? "Breakfast" : h >= 15 ? "Dinner" : "Lunch"; };
+
 // What a log says in a list
-function describe(log) {
+function describe(log, store) {
   const d = log.details || {};
   switch (log.kind) {
     case "fed": return { title: PORTION_LABEL[d.portion] || "Meal", sub: eatenText(d.eaten) };
@@ -187,7 +202,7 @@ function describe(log) {
     case "wee": return { title: "Wee" };
     case "poo": return { title: "Poo" };
     case "walk": return { title: d.mins ? `${d.mins} minute walk` : "Walk", sub: d.distance || null };
-    case "daycare": return { title: "Day at doggy daycare" };
+    case "daycare": { const n = store && daycareName(store, d.daycare); return { title: n ? `Day at ${n}` : "Day at doggy daycare" }; }
     case "flea": return { title: "Flea treatment" };
     case "worm": return { title: "Worming tablet" };
     case "weight": return { title: `Weighed ${fmtKg(d.kg)} kg` };
@@ -535,11 +550,16 @@ function useBarney(userId) {
 // ---------------------------------------------------------------------------
 const latestOf = (logs, kinds) => logs.find((l) => kinds.includes(l.kind)) || null;
 
-// Kibble left: the grams there were at counted_at, less the meals logged since
-// (full portion = meal_g, half = half that, treat only = 0). The same sums as
+// Kibble left: the grams there were at counted_at, less what he ate of the meals
+// logged since (full portion = meal_g, half = half that, treat only = 0). The same sums as
 // bt_food_status() in schema.sql, which bt-push and bt-alexa use.
 const PORTION_SHARE = { half: 0.5, treat: 0 };
-const shareOf = (l) => { const p = l.details && l.details.portion; return p in PORTION_SHARE ? PORTION_SHARE[p] : 1; };
+// Only what he ate counts (all of it until someone ticks how much)
+const shareOf = (l) => {
+  const d = l.details || {};
+  const portion = d.portion in PORTION_SHARE ? PORTION_SHARE[d.portion] : 1;
+  return portion * (typeof d.eaten === "number" ? d.eaten / 100 : 1);
+};
 function foodStatus(data, at = new Date()) {
   const f = (data.settings && data.settings.food) || {};
   const mealG = Number(f.meal_g) || 90;
@@ -589,17 +609,17 @@ function repeatDays(r) {
 const repeatOf = (store, plan) => (plan && plan.repeat_id && (store.repeats || []).find((r) => r.id === plan.repeat_id)) || null;
 
 // Where Barney is, from today's plans
-function whereNow(plans) {
+function whereNow(store) {
   const now = new Date();
-  const todays = plans.filter((p) => p.day === todayKey());
+  const todays = store.plans.filter((p) => p.day === todayKey());
   const current = todays.filter((p) => { const [s, e] = planSpan(p); return s <= now && now <= e; })
     .sort((a, b) => (a.all_day === b.all_day ? 0 : a.all_day ? 1 : -1))[0];
   if (current) {
-    const pl = PLACE[current.place];
+    const pl = placeOf(store, current);
     return { place: pl, text: current.all_day ? `${pl.now} today` : `${pl.now} until ${clock(planSpan(current)[1])}` };
   }
   const next = todays.filter((p) => !p.all_day && planSpan(p)[0] > now).sort(planOrder)[0];
-  if (next) return { place: PLACE[next.place], text: `${PLACE[next.place].label} from ${clockOf(next.start_time)}` };
+  if (next) { const pl = placeOf(store, next); return { place: pl, text: `${pl.label} from ${clockOf(next.start_time)}` }; }
   return null;
 }
 
@@ -716,7 +736,7 @@ function Choices({ label, options, value, onChange, wrap = true }) {
           const key = typeof o === "object" ? o.key : o;
           const text = typeof o === "object" ? o.label : o;
           return (
-            <button key={key} type="button" role="radio" aria-checked={value === key}
+            <button key={String(key)} type="button" role="radio" aria-checked={value === key}
               className={`choice ${value === key ? "is-on" : ""}`} onClick={() => onChange(key)}>{text}</button>
           );
         })}
@@ -737,7 +757,7 @@ function ConfirmButton({ label, confirmLabel, onConfirm }) {
 
 function LogRow({ store, log, onOpen, showDay }) {
   const k = KIND[log.kind] || { icon: "paw", label: log.kind };
-  const d = describe(log);
+  const d = describe(log, store);
   const who = whoOf(store, log);
   const at = new Date(log.at);
   const sub = [d.sub, log.note].filter(Boolean).join(". ");
@@ -786,7 +806,7 @@ function TodayScreen({ store, open, onLogged, photo }) {
   const meals = todays.filter((l) => l.kind === "fed").length;
   const walkMins = todays.filter((l) => l.kind === "walk").reduce((n, l) => n + (Number(l.details && l.details.mins) || 0), 0);
   const daycare = todays.some((l) => l.kind === "daycare");
-  const where = whereNow(store.plans);
+  const where = whereNow(store);
   const items = careItems(store);
   const food = foodStatus(store);
   const daycarePlan = store.plans.some((p) => p.day === today && p.place === "daycare");
@@ -811,7 +831,7 @@ function TodayScreen({ store, open, onLogged, photo }) {
   else walkLine = last(["walk", "daycare"]) ? `Last walk ${lowerAgo(last(["walk", "daycare"]).at)}` : "No walks logged yet";
 
   const tiles = [
-    { kind: "fed", label: "Fed", line: sinceText(["fed"]), note: fedNote, urgent: fedUrgent, onClick: () => quick("fed", { portion: "full", eaten: 100 }) },
+    { kind: "fed", label: "Fed", line: sinceText(["fed"]), note: fedNote, urgent: fedUrgent, onClick: () => quick("fed", { portion: "full", eaten: null }) },
     { kind: "water", label: "Water", line: sinceText(["water"]), onClick: () => quick("water") },
     { kind: "wee", label: "Wee", line: sinceText(["wee"]), onClick: () => quick("wee") },
     { kind: "poo", label: "Poo", line: sinceText(["poo"]), onClick: () => quick("poo") },
@@ -854,6 +874,20 @@ function TodayScreen({ store, open, onLogged, photo }) {
           <Icon name="chevronRight" size={22} className="tile-chevron" />
         </button>
       </section>
+
+      {todays.filter((l) => l.kind === "fed" && typeof (l.details || {}).eaten !== "number").map((l) => (
+        <section key={l.id} className="block eat-check" aria-label="How much did he eat?">
+          <p className="eat-q"><Icon name="bowl" size={22} /><span>{mealName(l.at)} went down at {clock(new Date(l.at))}. How much did he eat?</span></p>
+          <div className="choices">
+            {EATEN.map((e) => (
+              <button key={e.key} type="button" className="choice" onClick={() => {
+                store.updateLog(l.id, { details: { ...(l.details || {}), eaten: e.key } });
+                toast(e.key === 0 ? `${mealName(l.at)} not eaten` : `${mealName(l.at)}: ${eatenText(e.key).toLowerCase()}`);
+              }}>{e.label}</button>
+            ))}
+          </div>
+        </section>
+      ))}
 
       <button type="button" className="btn btn-quiet btn-block" onClick={() => open({ type: "add" })}>
         <Icon name="plus" size={20} /> Log something else
@@ -1166,7 +1200,7 @@ function PlansWeek({ store, open }) {
       {dayPlans.length === 0 ? <Empty>No plans for this day.</Empty> : (
         <ul className="list">
           {dayPlans.map((p) => {
-            const pl = PLACE[p.place] || PLACES[0];
+            const pl = placeOf(store, p);
             return (
               <li key={p.id}>
                 <button type="button" className="log-row" onClick={() => open({ type: "plan", plan: p })}>
@@ -1394,7 +1428,7 @@ function BarneyScreen({ store, open, photo, sub, session }) {
         {(store.repeats || []).length === 0 ? <Empty>Nothing repeats yet. Add daycare days once and they fill in every week.</Empty> : (
           <ul className="list">
             {store.repeats.map((r) => {
-              const pl = PLACE[r.place] || PLACES[0];
+              const pl = placeOf(store, r);
               return (
                 <li key={r.id}>
                   <button type="button" className="log-row" onClick={() => open({ type: "plan", repeat: r })}>
@@ -1438,6 +1472,10 @@ function BarneyScreen({ store, open, photo, sub, session }) {
       <section className="block" id="settings">
         <h2>Settings</h2>
         <ul className="list settings">
+          <li className="setting">
+            <span className="log-main"><span className="log-title">Daycares</span><span className="log-sub">{listText(daycaresOf(store).map((d) => d.name)) || "None yet"}</span></span>
+            <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "daycares" })}>Change</button>
+          </li>
           <li className="setting">
             <span className="log-main"><span className="log-title">Food</span><span className="log-sub">{(() => { const f = foodStatus(store); return `${f.mealG}g a meal, ${weight(f.bagG)} bags. Reminds you with ${plural(f.alertDays, "day")} left`; })()}</span></span>
             <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "food", settings: true })}>Change</button>
@@ -1633,7 +1671,7 @@ function importSummary(r) {
 // ---------------------------------------------------------------------------
 function defaultsFor(kind) {
   switch (kind) {
-    case "fed": return { portion: "full", eaten: 100 };
+    case "fed": return { portion: "full", eaten: null };
     case "walk": return { mins: 30, distance: "" };
     case "med": return { name: "", dose: "" };
     case "weight": return { kg: "" };
@@ -1752,7 +1790,16 @@ function WalkSheet({ store, onClose, onLogged, openDetails, onDone }) {
             </button>
           ))}
         </div>
-        <button type="button" className="btn btn-outline btn-block" onClick={() => log("daycare", {})}><Icon name="daycare" size={20} /> He's at daycare today</button>
+        {(() => {
+          // Today's daycare plan says which one
+          const plan = store.plans.find((p) => p.day === todayKey() && p.place === "daycare");
+          const name = plan && daycareName(store, plan.daycare);
+          return (
+            <button type="button" className="btn btn-outline btn-block" onClick={() => log("daycare", name ? { daycare: plan.daycare } : {})}>
+              <Icon name="daycare" size={20} /> He's at {name || "daycare"} today
+            </button>
+          );
+        })()}
         <button type="button" className="link-more" onClick={openDetails}>Add a distance, note or earlier time</button>
       </div>
     </Sheet>
@@ -1780,6 +1827,16 @@ function PlanSheet({ store, plan, repeat, day, weekly, onClose, openRepeat }) {
   const src = repeat || plan;
   const linked = repeatOf(store, plan);
   const [place, setPlace] = useState((src && src.place) || "home");
+  const [daycare, setDaycare] = useState((src && src.place === "daycare" && src.daycare) || null);
+  // The places to pick from: each daycare by name in place of "Doggy daycare"
+  // (which only shows for a plan that doesn't say which)
+  const choices = [];
+  for (const p of PLACES) {
+    if (p.key !== "daycare") { choices.push({ ...p, id: p.key, daycare: null }); continue; }
+    for (const d of daycaresOf(store)) choices.push({ ...p, id: `daycare:${d.id}`, label: d.name, daycare: d.id });
+    if (src && src.place === "daycare" && !daycareName(store, src.daycare)) choices.push({ ...p, id: "daycare:", daycare: null });
+  }
+  const picked = place === "daycare" ? `daycare:${daycare || ""}` : place;
   const [date, setDate] = useState((plan && plan.day) || (repeat && repeat.starts_on) || day || todayKey());
   const [allDay, setAllDay] = useState(src ? !!src.all_day : false);
   const [start, setStart] = useState((src && src.start_time && src.start_time.slice(0, 5)) || "09:00");
@@ -1805,9 +1862,9 @@ function PlanSheet({ store, plan, repeat, day, weekly, onClose, openRepeat }) {
     if (repeating) {
       if (!weekdays.length) { setBusy(false); toast("Pick at least one day of the week.", "error"); return; }
       if (until && until < date) { setBusy(false); toast("The last day needs to be after the first.", "error"); return; }
-      ok = await store.saveRepeat(repeat && repeat.id, { place, weekdays, starts_on: date, ends_on: until || null, ...times });
+      ok = await store.saveRepeat(repeat && repeat.id, { place, daycare: place === "daycare" ? daycare : null, weekdays, starts_on: date, ends_on: until || null, ...times });
     } else {
-      ok = await store.savePlan(plan && plan.id, { place, day: date, ...times });
+      ok = await store.savePlan(plan && plan.id, { place, daycare: place === "daycare" ? daycare : null, day: date, ...times });
     }
     setBusy(false);
     if (ok) onClose();
@@ -1824,15 +1881,16 @@ function PlanSheet({ store, plan, repeat, day, weekly, onClose, openRepeat }) {
       <form className="sheet-body" onSubmit={save}>
         {linked && (
           <div className="repeat-note">
-            <p>Part of {PLACE[linked.place] ? PLACE[linked.place].label : "a weekly plan"}, e{repeatDays(linked).slice(1)}. Changes here are just for this day.</p>
+            <p>Part of {placeOf(store, linked).label}, e{repeatDays(linked).slice(1)}. Changes here are just for this day.</p>
             <button type="button" className="btn btn-small btn-outline" onClick={() => openRepeat(linked)}>Change every week</button>
           </div>
         )}
         <div className="field">
           <span className="field-label" id="lbl-place">Place</span>
           <div className="places" role="radiogroup" aria-labelledby="lbl-place">
-            {PLACES.map((p) => (
-              <button key={p.key} type="button" role="radio" aria-checked={place === p.key} className={`place ${place === p.key ? "is-on" : ""}`} onClick={() => setPlace(p.key)} style={{ "--place": p.color }}>
+            {choices.map((p) => (
+              <button key={p.id} type="button" role="radio" aria-checked={picked === p.id} className={`place ${picked === p.id ? "is-on" : ""}`}
+                onClick={() => { setPlace(p.key); setDaycare(p.daycare); }} style={{ "--place": p.color }}>
                 <Icon name={p.icon} size={24} /><span>{p.label}</span>
               </button>
             ))}
@@ -1995,6 +2053,44 @@ function TreatmentSheet({ store, kind, onClose }) {
             {p.scheduled ? `Use the usual schedule (${shortDate(p.scheduled)})` : "Clear the due date"}
           </button>
         )}
+      </form>
+    </Sheet>
+  );
+}
+
+function DaycaresSheet({ store, onClose }) {
+  const [list, setList] = useState(() => daycaresOf(store).map((d) => ({ ...d })));
+  const [busy, setBusy] = useState(false);
+  const set = (i, name) => setList((l) => l.map((d, j) => (j === i ? { ...d, name } : d)));
+  const save = async (e) => {
+    e.preventDefault();
+    const clean = list.map((d) => ({ ...d, name: d.name.trim() })).filter((d) => d.name);
+    // New ones get an id from their name; renaming keeps the id, so plans follow
+    const used = new Set(clean.filter((d) => d.id).map((d) => d.id));
+    for (const d of clean) {
+      if (d.id) continue;
+      let id = slug(d.name) || "daycare", n = 2;
+      while (used.has(id)) id = `${slug(d.name) || "daycare"}-${n++}`;
+      used.add(id);
+      d.id = id;
+    }
+    setBusy(true);
+    const ok = await store.setSetting("daycares", clean);
+    setBusy(false);
+    if (ok) { toast("Daycares saved"); onClose(); }
+  };
+  return (
+    <Sheet title="His daycares" onClose={onClose}>
+      <form className="sheet-body" onSubmit={save}>
+        <p className="block-note">These show as places in plans. Renaming one keeps its plans; removing one leaves its plans as just "Doggy daycare".</p>
+        {list.map((d, i) => (
+          <div key={d.id || `new-${i}`} className="daycare-row">
+            <input className="input" aria-label={`Daycare ${i + 1}`} value={d.name} placeholder="Name" onChange={(e) => set(i, e.target.value)} />
+            <button type="button" className="icon-btn" aria-label={`Remove ${d.name || "this daycare"}`} onClick={() => setList((l) => l.filter((_, j) => j !== i))}><Icon name="close" /></button>
+          </div>
+        ))}
+        <button type="button" className="btn btn-quiet btn-block" onClick={() => setList((l) => [...l, { id: null, name: "" }])}><Icon name="plus" size={20} /> Add a daycare</button>
+        <button type="submit" className="btn btn-primary btn-block" disabled={busy}>Save</button>
       </form>
     </Sheet>
   );
@@ -2274,6 +2370,9 @@ function Main({ session }) {
         break;
       case "food":
         sheetEl = <FoodSheet store={store} buy={sheet.buy} settings={sheet.settings} onClose={close} />;
+        break;
+      case "daycares":
+        sheetEl = <DaycaresSheet store={store} onClose={close} />;
         break;
       case "treatment":
         sheetEl = <TreatmentSheet store={store} kind={sheet.kind} onClose={close} />;
