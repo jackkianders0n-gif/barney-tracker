@@ -266,11 +266,12 @@ async function runReminders(admin: Admin, forceHour: number | null) {
     }
   }
 
+  // 12pm: nothing logged today. 6pm: nothing logged since 3pm (a missed breakfast doesn't count)
   if (hour === 12 || hour === 18) {
-    const { count } = await admin.from("bt_log").select("id", { count: "exact", head: true }).eq("kind", "fed").gte("at", dayStart);
-    const meals = count ?? 0;
-    if (hour === 12 && meals === 0) messages.push({ title: "Has Barney had breakfast?", body: "No meal logged yet today.", tag: "fed-reminder", group: "nudges" });
-    if (hour === 18 && meals < 2) messages.push({ title: "Time for Barney's dinner?", body: meals === 0 ? "No meals logged today." : "Only one meal logged today.", tag: "fed-reminder", group: "nudges" });
+    const since = hour === 12 ? dayStart : new Date(londonMidnight(local.date).getTime() + 15 * 3600000).toISOString();
+    const { count } = await admin.from("bt_log").select("id", { count: "exact", head: true }).eq("kind", "fed").gte("at", since);
+    if (!count && hour === 12) messages.push({ title: "Has Barney had breakfast?", body: "No meal logged yet today.", tag: "fed-reminder", group: "nudges" });
+    if (!count && hour === 18) messages.push({ title: "Time for Barney's dinner?", body: "No dinner logged yet.", tag: "fed-reminder", group: "nudges" });
   }
 
   if (hour === 16) {

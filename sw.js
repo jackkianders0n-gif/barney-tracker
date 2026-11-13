@@ -1,6 +1,6 @@
 // Barney's Tracker service worker
 // Bump CACHE on every deploy (barney-v1 → barney-v2 …) so phones drop the old copy.
-const CACHE = "barney-v6";
+const CACHE = "barney-v7";
 
 const APP_FILES = [
   "./",

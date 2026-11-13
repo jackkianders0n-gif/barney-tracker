@@ -1,0 +1,70 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "barney's tracker",
+      "intents": [
+        {
+          "name": "SummaryIntent",
+          "slots": [],
+          "samples": [
+            "how he is",
+            "how barney is",
+            "how is barney",
+            "how's barney",
+            "how he's doing",
+            "how barney's doing",
+            "for an update",
+            "for news",
+            "what's new",
+            "when he last ate",
+            "when barney last ate",
+            "if he's been fed",
+            "if he's been walked"
+          ]
+        },
+        {
+          "name": "WalkIntent",
+          "slots": [],
+          "samples": [
+            "where to walk",
+            "where to walk him",
+            "where should we walk",
+            "where should we walk him",
+            "where to take him",
+            "where should we take him",
+            "which walk",
+            "which walk is best",
+            "for the best walk",
+            "for a walk",
+            "where's good for a walk",
+            "where to go for a walk"
+          ]
+        },
+        {
+          "name": "CareIntent",
+          "slots": [],
+          "samples": [
+            "what's due",
+            "what he's due",
+            "about his treatments",
+            "when his flea treatment is due",
+            "when is his flea treatment due",
+            "when he needs worming",
+            "when is his worming due",
+            "when is the vet",
+            "when he's at the vet",
+            "about the vet",
+            "when is the groomer",
+            "when he's at the groomer"
+          ]
+        },
+        { "name": "AMAZON.HelpIntent", "samples": [] },
+        { "name": "AMAZON.CancelIntent", "samples": [] },
+        { "name": "AMAZON.StopIntent", "samples": [] },
+        { "name": "AMAZON.NavigateHomeIntent", "samples": [] },
+        { "name": "AMAZON.FallbackIntent", "samples": [] }
+      ],
+      "types": []
+    }
+  }
+}
