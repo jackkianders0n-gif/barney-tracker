@@ -140,7 +140,8 @@ create index if not exists bt_appointments_day_idx on public.bt_appointments (da
 
 
 -- 5. Shared settings: food cupboard, Barney's details, photo, Alexa link key,
---    iCloud sync status, flea and worming schedule
+--    iCloud sync status, flea and worming schedule, daycares, walks
+--    (walks, walk_area, and tides written by bt-tides)
 --    (treatments: { flea: { every, unit: days|weeks|months, due?, due_set_at? }, worm: … })
 create table if not exists public.bt_settings (
   key    text primary key,

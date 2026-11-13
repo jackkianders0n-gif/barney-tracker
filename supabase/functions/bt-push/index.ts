@@ -210,7 +210,8 @@ function logMessage(log: any, name: string | null, daycare: string | null = null
     case "poo": return { title: "Barney's done a poo", body: by, tag: "toilet" };
     case "walk": {
       const mins = d.mins ? `${d.mins} minutes` : "A walk";
-      return { title: "Barney's been for a walk", body: `${mins}${name ? ` with ${name}` : ""}${late}.`, tag: "walk" };
+      const where = d.route ? ` at ${d.route}` : "";
+      return { title: "Barney's been for a walk", body: `${mins}${where}${name ? ` with ${name}` : ""}${late}.`, tag: "walk" };
     }
     case "daycare": return { title: daycare ? `Barney's at ${daycare}` : "Barney's at doggy daycare", body: by, tag: "walk" };
     default: return null;

@@ -10,7 +10,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 // ---------------------------------------------------------------------------
 const SUPABASE_URL = "https://wvedhcuebfdfkhfvphlb.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_bkeGnvruQEz3MsVDZiJ03g_bhXXDjgC";
-const APP_VERSION = "2.3.0";
+const APP_VERSION = "2.4.0";
 // The old Cloudflare app, read once by Barney → Settings → Bring over data from the old app
 const OLD_API = "https://barney-tracker-api.barneythebigdog.workers.dev";
 
@@ -201,7 +201,7 @@ function describe(log, store) {
     case "water": return { title: "Water topped up" };
     case "wee": return { title: "Wee" };
     case "poo": return { title: "Poo" };
-    case "walk": return { title: d.mins ? `${d.mins} minute walk` : "Walk", sub: d.distance || null };
+    case "walk": return { title: d.mins ? `${d.mins} minute walk` : "Walk", sub: [d.route, d.distance].filter(Boolean).join(", ") || null };
     case "daycare": { const n = store && daycareName(store, d.daycare); return { title: n ? `Day at ${n}` : "Day at doggy daycare" }; }
     case "flea": return { title: "Flea treatment" };
     case "worm": return { title: "Worming tablet" };
@@ -588,6 +588,177 @@ const whoOf = (store, log) => {
   return by && by !== "App" ? by : null;
 };
 
+// ---------------------------------------------------------------------------
+// Walks: which of your walks suits the weather (Open-Meteo, fetched by the
+// phone) and the tide (official UK tide times through bt-tides).
+// bt_settings.walks: [{ id, name, mins, tide: any|low|high, muddy, exposed, shady, daylight }]
+// bt_settings.walk_area: { name, lat, lon, station_id, station_name }
+// bt_settings.tides: { station, fetched_at, events: [{ type: high|low, at, height }] }
+// ---------------------------------------------------------------------------
+const WALK_TIDES = [{ key: "any", label: "Any tide" }, { key: "low", label: "Only when it's out" }, { key: "high", label: "Best when it's in" }];
+const WEATHER_KEY = "bt-weather-v1";
+function weatherText(code) {
+  if (code === 0) return "Clear";
+  if (code <= 2) return "Partly cloudy";
+  if (code === 3) return "Cloudy";
+  if (code === 45 || code === 48) return "Foggy";
+  if (code >= 51 && code <= 57) return "Drizzle";
+  if (code >= 61 && code <= 67) return "Rain";
+  if (code >= 71 && code <= 77) return "Snow";
+  if (code >= 80 && code <= 82) return "Showers";
+  if (code >= 85 && code <= 86) return "Snow showers";
+  if (code >= 95) return "Thunderstorms";
+  return "";
+}
+
+// Hourly weather for the walk area: two days back (for mud) and three ahead.
+// Kept on the phone for 30 minutes.
+function useWeather(area) {
+  const lat = area && area.lat, lon = area && area.lon;
+  const [wx, setWx] = useState(() => { const c = readJSON(WEATHER_KEY); return c && c.lat === lat && c.lon === lon ? c : null; });
+  useEffect(() => {
+    if (lat == null || lon == null) { setWx(null); return undefined; }
+    let gone = false;
+    const load = async () => {
+      const c = readJSON(WEATHER_KEY);
+      if (c && c.lat === lat && c.lon === lon) { if (!gone) setWx(c); if (Date.now() - c.at < 30 * 60000) return; }
+      try {
+        const res = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+          "&hourly=temperature_2m,apparent_temperature,precipitation,precipitation_probability,weather_code,wind_speed_10m,wind_gusts_10m" +
+          "&daily=sunrise,sunset&past_days=2&forecast_days=3&timezone=Europe%2FLondon&wind_speed_unit=mph");
+        if (!res.ok) throw new Error(`Weather ${res.status}`);
+        const j = await res.json();
+        const h = j.hourly || {}, d = j.daily || {};
+        const num = (a, i) => Number((a || [])[i]) || 0;
+        const next = {
+          lat, lon, at: Date.now(),
+          hours: (h.time || []).map((t, i) => ({
+            t: new Date(t).getTime(), temp: num(h.temperature_2m, i), feels: num(h.apparent_temperature, i), rain: num(h.precipitation, i),
+            chance: num(h.precipitation_probability, i), code: num(h.weather_code, i), wind: num(h.wind_speed_10m, i), gust: num(h.wind_gusts_10m, i),
+          })),
+          days: (d.time || []).map((day, i) => ({ day, sunrise: new Date(d.sunrise[i]).getTime(), sunset: new Date(d.sunset[i]).getTime() })),
+        };
+        writeJSON(WEATHER_KEY, next);
+        if (!gone) setWx(next);
+      } catch (e) { /* no signal: keep what we had */ }
+    };
+    load();
+    const onVisible = () => { if (document.visibilityState === "visible") load(); };
+    document.addEventListener("visibilitychange", onVisible);
+    const timer = setInterval(load, 30 * 60000);
+    return () => { gone = true; document.removeEventListener("visibilitychange", onVisible); clearInterval(timer); };
+  }, [lat, lon]);
+  return wx;
+}
+
+// Tide times for the area's station: shared through bt_settings.tides, and
+// fetched again by bt-tides once they're 6 hours old
+function useTides(store) {
+  const area = store.settings.walk_area;
+  const tides = store.settings.tides;
+  const station = area && area.station_id;
+  const asked = useRef(0);
+  const [error, setError] = useState(null);
+  useEffect(() => {
+    if (!station || store.offline) return;
+    const stale = !tides || tides.station !== station || Date.now() - new Date(tides.fetched_at).getTime() > 6 * 3600000;
+    if (!stale || Date.now() - asked.current < 10 * 60000) return;
+    asked.current = Date.now();
+    sb.functions.invoke("bt-tides", { body: { action: "events" } })
+      .then(async ({ error: err }) => {
+        if (!err) { setError(null); store.refresh(); return; }
+        let msg = "Couldn't get the tide times.";
+        try { const b = await err.context.json(); if (b && b.error) msg = b.error; } catch (e) { /* keep the plain message */ }
+        setError(msg);
+      })
+      .catch(() => {});
+  }, [station, tides && tides.fetched_at, store.offline]);
+  return { events: tides && tides.station === station ? tides.events || [] : [], error };
+}
+
+// How far in the tide is at a moment: level 0 = low water, 1 = high water
+function tideAt(events, t) {
+  const i = events.findIndex((e) => new Date(e.at).getTime() > t);
+  if (i <= 0) return null;
+  const prev = events[i - 1], next = events[i];
+  const a = new Date(prev.at).getTime(), b = new Date(next.at).getTime();
+  const p = Math.min(1, Math.max(0, (t - a) / (b - a)));
+  const rising = prev.type === "low";
+  return { level: rising ? (1 - Math.cos(Math.PI * p)) / 2 : (1 + Math.cos(Math.PI * p)) / 2, rising, next };
+}
+const tideWord = (tide) => (tide.level < 0.35 ? "out" : tide.level > 0.65 ? "in" : tide.rising ? "coming in" : "going out");
+const hourOf = (wx, t) => { const i = wx.hours.findIndex((h) => h.t > t); return wx.hours[i > 0 ? i - 1 : i < 0 ? wx.hours.length - 1 : 0] || null; };
+const dayOfWx = (wx, t) => wx.days.find((d) => d.day === dayKey(new Date(t))) || null;
+const rainBefore = (wx, t, hours) => wx.hours.filter((h) => h.t < t && h.t >= t - hours * 3600000).reduce((n, h) => n + h.rain, 0);
+
+// Is this a good time for this walk? no = reasons it's out, minus and plus = notes
+function judgeWalk(walk, t, wx, tides) {
+  const mins = Number(walk.mins) || 30;
+  const end = t + mins * 60000;
+  const no = [], minus = [], plus = [];
+  let score = 0;
+  const d = wx && dayOfWx(wx, t);
+  if (walk.daylight && d) {
+    if (t < d.sunrise) no.push(`Dark until ${clock(new Date(d.sunrise))}`);
+    else if (end > d.sunset) no.push(t >= d.sunset ? "Dark" : `Dark by ${clock(new Date(d.sunset))}`);
+  }
+  if (walk.tide === "low" || walk.tide === "high") {
+    const a = tideAt(tides, t), b = tideAt(tides, end);
+    if (!a) minus.push("Tide times not known");
+    else if (walk.tide === "low") {
+      if (Math.max(a.level, b ? b.level : a.level) > 0.4) no.push(`Tide's ${tideWord(a)}`); else { plus.push("Tide's out"); score += 10; }
+    } else if (Math.min(a.level, b ? b.level : a.level) < 0.6) no.push(`Tide's ${tideWord(a)}`); else { plus.push("Tide's in"); score += 10; }
+  }
+  const h = wx && hourOf(wx, t);
+  if (h) {
+    if (h.chance >= 60 || h.rain >= 1) { score -= 30; minus.push("Rain likely"); }
+    else if (h.chance >= 30) { score -= 10; minus.push("Chance of showers"); }
+    if (walk.exposed) {
+      if (h.gust >= 35) { score -= 35; minus.push(`Gusts of ${Math.round(h.gust)}mph`); }
+      else if (h.gust >= 25) { score -= 10; minus.push("Breezy"); }
+    }
+    if (h.feels >= 24) {
+      if (walk.shady) { score += 10; plus.push("Shady"); } else { score -= 20; minus.push(`Hot, ${Math.round(h.feels)}°C`); }
+      if (mins > 45) { score -= 15; minus.push("Long for a hot day"); }
+    }
+  }
+  if (walk.muddy && wx) {
+    const mm = rainBefore(wx, t, 48);
+    if (mm >= 15) { score -= 30; minus.push(`Muddy after ${Math.round(mm)}mm of rain`); }
+    else if (mm >= 6) { score -= 10; minus.push("Could be muddy"); }
+  }
+  return { ok: no.length === 0, score, no, minus, plus };
+}
+
+// Every walk, judged now and at each half hour of the next 12 (6am to 9pm),
+// best first
+function walkPlan(store, wx, tides) {
+  const walks = Array.isArray(store.settings.walks) ? store.settings.walks : [];
+  const now = Date.now();
+  const later = [];
+  for (let t = Math.ceil(now / 1800000) * 1800000; t <= now + 12 * 3600000; t += 1800000) {
+    const hr = new Date(t).getHours();
+    if (t > now && hr >= 6 && hr <= 21) later.push(t);
+  }
+  const list = walks.map((walk) => {
+    const nowJ = judgeWalk(walk, now, wx, tides);
+    let best = null;
+    for (const t of later) {
+      const j = judgeWalk(walk, t, wx, tides);
+      if (j.ok && (!best || j.score > best.j.score)) best = { t, j };
+    }
+    // Only worth saying if it's better than now
+    if (best && nowJ.ok && best.j.score <= nowJ.score + 10) best = null;
+    return { walk, now: nowJ, best };
+  });
+  list.sort((a, b) => (b.now.ok - a.now.ok) || (b.now.score - a.now.score) || ((a.best ? a.best.t : Infinity) - (b.best ? b.best.t : Infinity)));
+  return list;
+}
+// Good now / Not ideal (possible, but something's against it) / Not now
+const walkStatus = (j) => (!j.ok ? { key: "no", label: "Not now" } : j.score <= -20 ? { key: "meh", label: "Not ideal" } : { key: "ok", label: "Good now" });
+const walkNotes = (j) => [...j.no, ...j.plus, ...j.minus].slice(0, 3).join(". ");
+const whenText = (t) => `${dayKey(new Date(t)) === todayKey() ? "" : "tomorrow "}${clock(new Date(t))}`;
+
 function planSpan(p) {
   if (p.all_day || !p.start_time) return [new Date(`${p.day}T00:00:00`), new Date(`${p.day}T23:59:59`)];
   const s = new Date(`${p.day}T${p.start_time.slice(0, 5)}:00`);
@@ -796,7 +967,7 @@ function Empty({ children }) {
 // ---------------------------------------------------------------------------
 // Today
 // ---------------------------------------------------------------------------
-function TodayScreen({ store, open, onLogged, photo }) {
+function TodayScreen({ store, open, onLogged, photo, wx, tides }) {
   useNow();
   const [flash, setFlash] = useState(null);
   const logs = store.logs;
@@ -875,6 +1046,8 @@ function TodayScreen({ store, open, onLogged, photo }) {
         </button>
       </section>
 
+      <WalkSuggestion store={store} wx={wx} tides={tides} />
+
       {todays.filter((l) => l.kind === "fed" && typeof (l.details || {}).eaten !== "number").map((l) => (
         <section key={l.id} className="block eat-check" aria-label="How much did he eat?">
           <p className="eat-q"><Icon name="bowl" size={22} /><span>{mealName(l.at)} went down at {clock(new Date(l.at))}. How much did he eat?</span></p>
@@ -942,6 +1115,120 @@ function TodayScreen({ store, open, onLogged, photo }) {
             </ul>
           )}
         {todays.length > 8 && <a className="link-more" href="#/diary">See all {todays.length} in the diary</a>}
+      </section>
+    </main>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Walks
+// ---------------------------------------------------------------------------
+// One line on Today: the best walk now, or the next good one
+function WalkSuggestion({ store, wx, tides }) {
+  const area = store.settings.walk_area;
+  const walks = Array.isArray(store.settings.walks) ? store.settings.walks : [];
+  const go = () => { location.hash = "#/walks"; };
+  let title, sub;
+  if (!area || !walks.length) {
+    title = "Walk ideas";
+    sub = !area ? "Set your area and add your walks" : "Add your walks to get suggestions";
+  } else {
+    const plan = walkPlan(store, wx, tides.events);
+    const top = plan.find((p) => p.now.ok);
+    const next = !top && plan.filter((p) => p.best).sort((a, b) => a.best.t - b.best.t)[0];
+    if (top) { title = `${walkStatus(top.now).key === "ok" ? "Good now" : "Best now"}: ${top.walk.name}`; sub = walkNotes(top.now) || "Nothing against it"; }
+    else if (next) { title = `${next.walk.name} at ${whenText(next.best.t)}`; sub = walkNotes(next.best.j) || "The next good walk"; }
+    else { title = "No good walks for a while"; sub = plan[0] ? walkNotes(plan[0].now) : ""; }
+  }
+  return (
+    <button type="button" className="walk-tip" onClick={go}>
+      <Icon name="lead" size={22} />
+      <span className="log-main"><span className="log-title">{title}</span>{sub && <span className="log-sub">{sub}</span>}</span>
+      <Icon name="chevronRight" size={20} className="row-chevron" />
+    </button>
+  );
+}
+
+function WalksScreen({ store, open, onLogged, wx, tides }) {
+  useNow();
+  const area = store.settings.walk_area;
+  const walks = Array.isArray(store.settings.walks) ? store.settings.walks : [];
+  const plan = walkPlan(store, wx, tides.events);
+  const now = Date.now();
+  const h = wx && hourOf(wx, now);
+  const d = wx && dayOfWx(wx, now);
+  const mud = wx ? Math.round(rainBefore(wx, now, 48)) : null;
+  const tide = tideAt(tides.events, now);
+  const coming = tides.events.filter((e) => new Date(e.at).getTime() > now).slice(0, 4);
+  const went = (w) => onLogged(store.addLog("walk", { mins: Number(w.mins) || 30, distance: "", route: w.name }));
+
+  if (!area) {
+    return (
+      <main className="screen">
+        <ScreenHead title="Walks" />
+        <section className="block">
+          <p className="block-note">Tell the app where you walk Barney, and it suggests which of your walks suits the weather and the tide.</p>
+          <button type="button" className="btn btn-primary btn-block" onClick={() => open({ type: "area" })}>Set your area</button>
+        </section>
+      </main>
+    );
+  }
+  return (
+    <main className="screen">
+      <ScreenHead title="Walks" action={<button type="button" className="collar-action" onClick={() => open({ type: "walkEdit" })}><Icon name="plus" size={20} /> Add</button>} />
+
+      <section className="block conditions" aria-label="Weather and tide">
+        <div className="cond-row">
+          <span className="cond-big">{h ? `${Math.round(h.temp)}°C` : "–"}</span>
+          <span className="log-main">
+            <span className="log-title">{h ? weatherText(h.code) || "Weather" : "Weather not loaded yet"}</span>
+            {h && <span className="log-sub">{`Feels ${Math.round(h.feels)}°C. Wind ${Math.round(h.wind)}mph, gusts ${Math.round(h.gust)}. Rain ${Math.round(h.chance)}%`}</span>}
+          </span>
+        </div>
+        {wx && <p className="cond-line">{`${mud}mm of rain in the last 2 days${mud >= 15 ? ", so it'll be muddy" : mud >= 6 ? ", could be muddy" : ""}.`}{d ? ` Sunset ${clock(new Date(d.sunset))}.` : ""}</p>}
+        <p className="cond-line">
+          {!area.station_id ? "No tide station picked."
+            : tide ? `Tide's ${tideWord(tide)}. ${tide.next.type === "low" ? "Low" : "High"} at ${clock(new Date(tide.next.at))}.`
+            : tides.error || "Tide times not loaded yet."}
+        </p>
+        {coming.length > 0 && (
+          <div className="tide-times">
+            {coming.map((e) => (
+              <span key={e.at} className="tide-time"><b>{e.type === "low" ? "Low" : "High"}</b>{whenText(new Date(e.at).getTime())}</span>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="block">
+        <h2>Your walks</h2>
+        {walks.length === 0 ? <Empty>Add the walks you go on, and what matters for each, like the tide or mud.</Empty> : (
+          <ul className="list walks">
+            {plan.map(({ walk, now: j, best }) => (
+              <li key={walk.id} className={`walk is-${walkStatus(j).key}`}>
+                <button type="button" className="walk-main" onClick={() => open({ type: "walkEdit", walk })}>
+                  <span className="log-title">{walk.name}<span className="walk-mins"> {walk.mins} min</span></span>
+                  <span className="walk-status">{walkStatus(j).label}</span>
+                  <span className="log-sub">{walkNotes(j) || "Nothing against it"}</span>
+                  {best && <span className="walk-best">{`Better at ${whenText(best.t)}${walkNotes(best.j) ? `: ${walkNotes(best.j)}` : ""}`}</span>}
+                  {!j.ok && !best && <span className="walk-best">Not in the next 12 hours</span>}
+                </button>
+                <button type="button" className="btn btn-small btn-outline" onClick={() => went(walk)}>We went</button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <button type="button" className="btn btn-quiet btn-block" onClick={() => open({ type: "walkEdit" })}><Icon name="plus" size={20} /> Add a walk</button>
+      </section>
+
+      <section className="block">
+        <ul className="list settings">
+          <li className="setting">
+            <span className="log-main"><span className="log-title">{area.name}</span><span className="log-sub">{area.station_name ? `Tides: ${area.station_name}` : "No tide station"}</span></span>
+            <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "area" })}>Change</button>
+          </li>
+        </ul>
+        <p className="fineprint">Weather from Open-Meteo. Tide times contain ADMIRALTY® data, © Crown copyright, UK Hydrographic Office. Not for navigation.</p>
       </section>
     </main>
   );
@@ -1774,6 +2061,8 @@ function LogSheet({ store, kind, log, onClose }) {
 }
 
 function WalkSheet({ store, onClose, onLogged, openDetails, onDone }) {
+  const walks = Array.isArray(store.settings.walks) ? store.settings.walks : [];
+  const [route, setRoute] = useState(null);
   const log = (kind, details) => {
     const row = store.addLog(kind, details);
     onLogged(row);
@@ -1783,9 +2072,12 @@ function WalkSheet({ store, onClose, onLogged, openDetails, onDone }) {
   return (
     <Sheet title="How long was the walk?" onClose={onClose}>
       <div className="sheet-body">
+        {walks.length > 0 && (
+          <Choices label="Which walk (optional)" options={walks.map((w) => ({ key: w.name, label: w.name }))} value={route} onChange={(v) => setRoute(route === v ? null : v)} />
+        )}
         <div className="minutes">
           {WALK_MINS.map((m) => (
-            <button key={m} type="button" className="minute" onClick={() => log("walk", { mins: m, distance: "" })}>
+            <button key={m} type="button" className="minute" onClick={() => log("walk", route ? { mins: m, distance: "", route } : { mins: m, distance: "" })}>
               <b>{m}</b><span>minutes</span>
             </button>
           ))}
@@ -2058,6 +2350,124 @@ function TreatmentSheet({ store, kind, onClose }) {
   );
 }
 
+// Where you walk: a place to get the weather for, and the nearest tide station
+function AreaSheet({ store, onClose }) {
+  const area = store.settings.walk_area || null;
+  const [q, setQ] = useState("");
+  const [found, setFound] = useState(null);
+  const [place, setPlace] = useState(area);
+  const [stations, setStations] = useState(null);
+  const [stationError, setStationError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const search = async (e) => {
+    e.preventDefault();
+    if (!q.trim()) return;
+    setBusy(true);
+    try {
+      const res = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q.trim())}&count=6&language=en&countryCode=GB`);
+      const j = await res.json();
+      setFound((j && j.results) || []);
+    } catch (err) {
+      toast("No signal. Try again when you're back online.", "error");
+    } finally { setBusy(false); }
+  };
+  const pick = async (r) => {
+    const p = { name: [r.name, r.admin2 || r.admin1].filter(Boolean).join(", "), lat: Math.round(r.latitude * 1000) / 1000, lon: Math.round(r.longitude * 1000) / 1000 };
+    setPlace(p); setFound(null); setStations(null); setStationError(null);
+    const { data, error } = await sb.functions.invoke("bt-tides", { body: { action: "stations", lat: p.lat, lon: p.lon } });
+    if (error) {
+      let msg = "Couldn't find tide stations.";
+      try { const b = await error.context.json(); if (b && b.error) msg = b.error; } catch (e) { /* keep the plain message */ }
+      setStationError(msg);
+    } else setStations((data && data.stations) || []);
+  };
+  const save = async (station) => {
+    setBusy(true);
+    const ok = await store.setSetting("walk_area", { ...place, station_id: station ? station.id : null, station_name: station ? station.name : null });
+    setBusy(false);
+    if (ok) { toast("Area saved"); onClose(); }
+  };
+  return (
+    <Sheet title="Where you walk" onClose={onClose}>
+      <div className="sheet-body">
+        <form onSubmit={search} className="stack">
+          <Field label="Town or village" id="area-q" hint={place ? `Now: ${place.name}` : null}>
+            <input id="area-q" className="input" value={q} onChange={(e) => setQ(e.target.value)} placeholder="For example, Studland" />
+          </Field>
+          <button type="submit" className="btn btn-outline btn-block" disabled={busy || !q.trim()}>Search</button>
+        </form>
+        {found && (found.length === 0 ? <Empty>Nothing found by that name.</Empty> : (
+          <ul className="list">
+            {found.map((r) => (
+              <li key={r.id}><button type="button" className="log-row" onClick={() => pick(r)}>
+                <span className="log-main"><span className="log-title">{r.name}</span><span className="log-sub">{[r.admin2, r.admin1].filter(Boolean).join(", ")}</span></span>
+              </button></li>
+            ))}
+          </ul>
+        ))}
+        {place && place !== area && (
+          <>
+            <h3 className="sub-head">Tide station near {place.name.split(",")[0]}</h3>
+            {stationError && <p className="notice notice-error">{stationError}</p>}
+            {stations && (
+              <ul className="list">
+                {stations.map((st) => (
+                  <li key={st.id}><button type="button" className="log-row" onClick={() => save(st)} disabled={busy}>
+                    <span className="log-main"><span className="log-title">{st.name}</span><span className="log-sub">{st.km} km away</span></span>
+                  </button></li>
+                ))}
+              </ul>
+            )}
+            {!stations && !stationError && <p className="block-note">Finding tide stations…</p>}
+            <button type="button" className="link-more" onClick={() => save(null)}>Save without tides</button>
+          </>
+        )}
+      </div>
+    </Sheet>
+  );
+}
+
+function WalkEditSheet({ store, walk, onClose }) {
+  const all = Array.isArray(store.settings.walks) ? store.settings.walks : [];
+  const [w, setW] = useState(() => ({ name: "", mins: 30, tide: "any", muddy: false, exposed: false, shady: false, daylight: false, ...(walk || {}) }));
+  const [busy, setBusy] = useState(false);
+  const set = (patch) => setW((x) => ({ ...x, ...patch }));
+  const write = async (list, msg) => {
+    setBusy(true);
+    const ok = await store.setSetting("walks", list);
+    setBusy(false);
+    if (ok) { toast(msg); onClose(); }
+  };
+  const save = (e) => {
+    e.preventDefault();
+    const row = { ...w, name: w.name.trim(), mins: Math.max(5, Math.round(Number(w.mins)) || 30), id: w.id || uuid() };
+    if (!row.name) return;
+    write(walk ? all.map((x) => (x.id === walk.id ? row : x)) : [...all, row], "Walk saved");
+  };
+  const Toggle = ({ k, label, hint }) => (
+    <label className="toggle">
+      <input type="checkbox" checked={!!w[k]} onChange={(e) => set({ [k]: e.target.checked })} />
+      <span className="toggle-ui" aria-hidden="true" />
+      <span className="log-main"><span>{label}</span>{hint && <span className="log-sub">{hint}</span>}</span>
+    </label>
+  );
+  return (
+    <Sheet title={walk ? walk.name : "Add a walk"} onClose={onClose}>
+      <form className="sheet-body" onSubmit={save}>
+        <Field label="Name" id="walk-name"><input id="walk-name" className="input" value={w.name} onChange={(e) => set({ name: e.target.value })} placeholder="For example, Studland beach" required /></Field>
+        <Choices label="How long it usually takes" options={WALK_MINS.map((m) => ({ key: m, label: `${m} min` }))} value={Number(w.mins)} onChange={(v) => set({ mins: v })} />
+        <Choices label="Tide" options={WALK_TIDES} value={w.tide} onChange={(v) => set({ tide: v })} />
+        {Toggle({ k: "muddy", label: "Gets muddy after rain" })}
+        {Toggle({ k: "exposed", label: "Exposed to the wind", hint: "Avoided in strong gusts" })}
+        {Toggle({ k: "shady", label: "Shady", hint: "Better on hot days" })}
+        {Toggle({ k: "daylight", label: "Needs daylight", hint: "Unlit paths" })}
+        <button type="submit" className="btn btn-primary btn-block" disabled={busy || !w.name.trim()}>{walk ? "Save changes" : "Add walk"}</button>
+        {walk && <ConfirmButton label="Delete walk" confirmLabel="Tap again to delete" onConfirm={() => write(all.filter((x) => x.id !== walk.id), "Walk deleted")} />}
+      </form>
+    </Sheet>
+  );
+}
+
 function DaycaresSheet({ store, onClose }) {
   const [list, setList] = useState(() => daycaresOf(store).map((d) => ({ ...d })));
   const [busy, setBusy] = useState(false);
@@ -2234,6 +2644,7 @@ function UndoBar({ undo, onUndo, onChange }) {
 
 const TABS = [
   { key: "today", label: "Today", icon: "paw" },
+  { key: "walks", label: "Walks", icon: "lead" },
   { key: "diary", label: "Diary", icon: "book" },
   { key: "health", label: "Health", icon: "heart" },
   { key: "barney", label: "Barney", icon: "dog" },
@@ -2300,6 +2711,8 @@ function SignIn() {
 
 function Main({ session }) {
   const store = useBarney(session.user.id);
+  const wx = useWeather(store.settings.walk_area);
+  const tides = useTides(store);
   const route = useRoute();
   const [sheet, setSheet] = useState(null);
   const [undo, setUndo] = useState(null);
@@ -2339,10 +2752,11 @@ function Main({ session }) {
   }
 
   let screen;
-  if (route.tab === "diary") screen = <DiaryScreen store={store} open={setSheet} />;
+  if (route.tab === "walks") screen = <WalksScreen store={store} open={setSheet} onLogged={onLogged} wx={wx} tides={tides} />;
+  else if (route.tab === "diary") screen = <DiaryScreen store={store} open={setSheet} />;
   else if (route.tab === "health") screen = <HealthScreen store={store} open={setSheet} onLogged={onLogged} />;
   else if (route.tab === "barney") screen = <BarneyScreen store={store} open={setSheet} photo={photo} sub={route.sub} session={session} />;
-  else screen = <TodayScreen store={store} open={setSheet} onLogged={onLogged} photo={photo} />;
+  else screen = <TodayScreen store={store} open={setSheet} onLogged={onLogged} photo={photo} wx={wx} tides={tides} />;
 
   let sheetEl = null;
   if (sheet) {
@@ -2370,6 +2784,12 @@ function Main({ session }) {
         break;
       case "food":
         sheetEl = <FoodSheet store={store} buy={sheet.buy} settings={sheet.settings} onClose={close} />;
+        break;
+      case "area":
+        sheetEl = <AreaSheet store={store} onClose={close} />;
+        break;
+      case "walkEdit":
+        sheetEl = <WalkEditSheet key={(sheet.walk && sheet.walk.id) || "new"} store={store} walk={sheet.walk} onClose={close} />;
         break;
       case "daycares":
         sheetEl = <DaycaresSheet store={store} onClose={close} />;
