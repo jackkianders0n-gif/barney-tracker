@@ -93,12 +93,21 @@ const GRAPHICS = {
 
 const COLORS = { cream: "#FBF4EA", paper: "#FFFDF9", navy: "#1B2340", apricot: "#E9B97F", apricotSoft: "#F6E2C6", tan: "#C98A4B", tanInk: "#8A5523", line: "#E8D9C4", inkSoft: "#5B6178" };
 
+// Sizes in dp, worked out from the screen so nothing depends on percentages (which
+// some Echo screens resolve against the whole screen): the collar is 100 high; under
+// it the tiles have 24 either side, 20 between, 20 above, 20 between rows, 24 below.
+const COLLAR_H = 100;
+const TILE_W = "${Math.max(200, (viewport.width - 68) / 2)}";
+const TILE_H = "${Math.max(120, (viewport.height - 164) / 2)}";
+const TILE_IN_W = "${Math.max(196, (viewport.width - 68) / 2 - 4)}"; // inside the 2dp border
+const TILE_IN_H = "${Math.max(116, (viewport.height - 164) / 2 - 4)}";
+
 // One tile. Its bound values change on the device as soon as it's tapped; the skill
 // then logs it and shows "Wee logged · Undo" along the top.
 const TILE = {
   parameters: ["kind", "label", "icon", "tile", "words"],
   item: {
-    type: "TouchWrapper", id: "tile-${kind}", grow: 1, width: 0,
+    type: "TouchWrapper", id: "tile-${kind}", width: TILE_W, height: TILE_H,
     bind: [
       { name: "justLogged", value: false, type: "boolean" },
       { name: "down", value: "${tile.down == true}", type: "boolean" },
@@ -121,11 +130,11 @@ const TILE = {
       },
     ],
     item: {
-      type: "Frame", height: "100%", borderRadius: 24, borderWidth: 2,
+      type: "Frame", width: TILE_W, height: TILE_H, borderRadius: 24, borderWidth: 2,
       backgroundColor: "${justLogged ? '#F6E2C6' : '#FFFDF9'}",
       borderColor: "${down ? '#E9B97F' : '#E8D9C4'}",
       item: {
-        type: "Container", direction: "row", alignItems: "center", height: "100%", paddingLeft: 22, paddingRight: 18,
+        type: "Container", direction: "row", alignItems: "center", width: TILE_IN_W, height: TILE_IN_H, paddingLeft: 22, paddingRight: 18,
         items: [
           {
             type: "Frame", width: 84, height: 84, borderRadius: 42, backgroundColor: "${justLogged ? '#1B2340' : '#F6E2C6'}",
@@ -153,7 +162,7 @@ const TILE = {
 
 const CARD_DOC = {
   type: "APL", version: "1.8", theme: "light",
-  settings: { idleTimeout: 300000 },
+  settings: { idleTimeout: 60000 }, // back to the home screen a minute after the last tap
   graphics: GRAPHICS,
   layouts: { Tile: TILE },
   mainTemplate: {
@@ -161,13 +170,13 @@ const CARD_DOC = {
     item: {
       type: "Frame", width: "100vw", height: "100vh", backgroundColor: COLORS.cream,
       item: {
-        type: "Container", width: "100%", height: "100%",
+        type: "Container", width: "100vw", height: "100vh",
         items: [
           // The navy collar: his photo, his name and today's walking, and what was just logged
           {
-            type: "Frame", backgroundColor: COLORS.navy, width: "100%",
+            type: "Frame", backgroundColor: COLORS.navy, width: "100vw", height: COLLAR_H,
             item: {
-              type: "Container", direction: "row", alignItems: "center", paddingLeft: 28, paddingRight: 24, paddingTop: 14, paddingBottom: 14,
+              type: "Container", direction: "row", alignItems: "center", width: "100vw", height: COLLAR_H, paddingLeft: 28, paddingRight: 24,
               items: [
                 {
                   type: "Frame", width: 72, height: 72, borderRadius: 36, borderWidth: 3, borderColor: COLORS.apricot,
@@ -202,17 +211,17 @@ const CARD_DOC = {
           },
           // The four tiles
           {
-            type: "Container", grow: 1, direction: "column", paddingLeft: 24, paddingRight: 24, paddingTop: 20, paddingBottom: 24,
+            type: "Container", direction: "column", paddingLeft: 24, paddingRight: 24, paddingTop: 20, paddingBottom: 24,
             items: [
               {
-                type: "Container", direction: "row", grow: 1,
+                type: "Container", direction: "row", height: TILE_H,
                 items: [
                   { type: "Tile", kind: "fed", label: "Fed", icon: "bowl", tile: "${barney.card.fed}", words: "${barney.words}" },
                   { type: "Tile", kind: "water", label: "Water", icon: "water", tile: "${barney.card.water}", words: "${barney.words}", spacing: 20 },
                 ],
               },
               {
-                type: "Container", direction: "row", grow: 1, spacing: 20,
+                type: "Container", direction: "row", height: TILE_H, spacing: 20,
                 items: [
                   { type: "Tile", kind: "wee", label: "Wee", icon: "hydrant", tile: "${barney.card.wee}", words: "${barney.words}" },
                   { type: "Tile", kind: "poo", label: "Poo", icon: "poo", tile: "${barney.card.poo}", words: "${barney.words}", spacing: 20 },
@@ -225,7 +234,7 @@ const CARD_DOC = {
             type: "Frame", id: "eatenPanel", position: "absolute", top: 0, left: 0, width: "100vw", height: "100vh",
             backgroundColor: "rgba(27, 35, 64, 0.7)", display: "none",
             item: {
-              type: "Container", width: "100%", height: "100%", justifyContent: "center", alignItems: "center",
+              type: "Container", width: "100vw", height: "100vh", justifyContent: "center", alignItems: "center",
               items: [{
                 type: "Frame", backgroundColor: COLORS.cream, borderRadius: 28, width: "88vw",
                 item: {
