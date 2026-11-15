@@ -5,7 +5,8 @@
 // POST {"action":"log","id":"<id>"}  → tell everyone else about a new log (database trigger),
 //                                      on the phones that chose to hear about that kind
 // POST {"action":"refused","id":"<id>","by":"<user>"} → a meal marked as not eaten (database trigger)
-// POST {"action":"check"}            → the 8am / 12pm / 4pm / 6pm reminders (hourly cron job)
+// POST {"action":"check"}            → the 8am / 12pm / 4pm / 6pm reminders (hourly cron job);
+//                                       no meal reminder while his food's down (latest meal not ticked)
 //
 // Needs "Verify JWT" turned OFF: the database can't sign in. Calls from the
 // database carry the private fn_key in an x-bt-key header; calls from the app
@@ -266,12 +267,15 @@ async function runReminders(admin: Admin, forceHour: number | null) {
     }
   }
 
-  // 12pm: nothing logged today. 6pm: nothing logged since 3pm (a missed breakfast doesn't count)
+  // 12pm: nothing logged today. 6pm: nothing logged since 3pm (a missed breakfast doesn't count).
+  // Neither while his food's down: today's latest meal not ticked yet (foodDown() in app.jsx).
   if (hour === 12 || hour === 18) {
-    const since = hour === 12 ? dayStart : new Date(londonMidnight(local.date).getTime() + 15 * 3600000).toISOString();
-    const { count } = await admin.from("bt_log").select("id", { count: "exact", head: true }).eq("kind", "fed").gte("at", since);
-    if (!count && hour === 12) messages.push({ title: "Has Barney had breakfast?", body: "No meal logged yet today.", tag: "fed-reminder", group: "nudges" });
-    if (!count && hour === 18) messages.push({ title: "Time for Barney's dinner?", body: "No dinner logged yet.", tag: "fed-reminder", group: "nudges" });
+    const since = hour === 12 ? Date.parse(dayStart) : londonMidnight(local.date).getTime() + 15 * 3600000;
+    const { data: meals } = await admin.from("bt_log").select("at, details").eq("kind", "fed").gte("at", dayStart).order("at", { ascending: false });
+    const down = !!meals?.length && typeof (meals[0] as any).details?.eaten !== "number";
+    const count = (meals ?? []).filter((m: any) => Date.parse(m.at) >= since).length;
+    if (!down && !count && hour === 12) messages.push({ title: "Has Barney had breakfast?", body: "No meal logged yet today.", tag: "fed-reminder", group: "nudges" });
+    if (!down && !count && hour === 18) messages.push({ title: "Time for Barney's dinner?", body: "No dinner logged yet.", tag: "fed-reminder", group: "nudges" });
   }
 
   if (hour === 16) {

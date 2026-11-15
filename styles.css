@@ -144,6 +144,8 @@ code { font-size: .9em; background: var(--apricot-soft); padding: 1px 6px; borde
 .tile.is-urgent { border-color: #E9B3A6; box-shadow: 0 4px 0 #E9B3A6; }
 .tile.is-urgent .tile-note, .tile.is-urgent .tile-line { color: var(--alert); font-weight: 600; }
 .tile.is-logged { background: var(--apricot-soft); }
+/* His food is down: the Fed tile asks how much he ate */
+.tile.is-waiting { border-color: var(--apricot); box-shadow: 0 4px 0 var(--apricot); }
 .tile.is-logged .tile-icon { background: var(--navy); color: var(--apricot); animation: pop .35s ease; }
 @keyframes pop { 0% { transform: scale(.7); } 70% { transform: scale(1.12); } 100% { transform: scale(1); } }
 
@@ -340,10 +342,6 @@ input[type="date"].input, input[type="time"].input, input[type="datetime-local"]
 .weekdays { gap: 6px; flex-wrap: nowrap; }
 .weekdays .choice { flex: 1 1 0; min-width: 0; padding: 0; }
 .repeats-head { margin-top: 22px; }
-.eat-check { background: var(--paper); border: 1.5px solid var(--apricot); border-radius: 18px; padding: 14px; }
-.eat-q { display: flex; align-items: flex-start; gap: 10px; font-weight: 600; margin: 0 0 12px; line-height: 1.35; }
-.eat-q svg { color: var(--tan); flex-shrink: 0; }
-.eat-check .choices { gap: 6px; }
 .eat-check .choice { padding: 0 12px; }
 .daycare-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .daycare-row .input { flex: 1; }

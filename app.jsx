@@ -10,7 +10,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 // ---------------------------------------------------------------------------
 const SUPABASE_URL = "https://wvedhcuebfdfkhfvphlb.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_bkeGnvruQEz3MsVDZiJ03g_bhXXDjgC";
-const APP_VERSION = "2.6.1";
+const APP_VERSION = "2.7.0";
 // The old Cloudflare app, read once by Barney → Settings → Bring over data from the old app
 const OLD_API = "https://barney-tracker-api.barneythebigdog.workers.dev";
 
@@ -181,6 +181,15 @@ function ago(iso) {
 const lowerAgo = (iso) => (ago(iso) || "").replace(/^(Just|Yesterday|An)\b/, (w) => w.toLowerCase());
 const toLocalInput = (d) => `${dayKey(d)}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 
+// His food's down: today's latest meal, if nobody has said yet how much he ate.
+// bt-push skips the 12pm and 6pm meal reminders while this is true (keep them in step).
+function foodDown(logs) {
+  const today = todayKey();
+  const latest = logs.filter((l) => l.kind === "fed" && dayKey(new Date(l.at)) === today)
+    .sort((a, b) => new Date(b.at) - new Date(a.at))[0];
+  return latest && typeof (latest.details || {}).eaten !== "number" ? latest : null;
+}
+
 function eatenText(e) {
   if (typeof e !== "number") return "Not ticked yet";
   if (e >= 100) return "Ate it all";
@@ -190,6 +199,13 @@ function eatenText(e) {
   return "Didn't eat it";
 }
 
+// "Ate most of it at 7:40am" / "Didn't eat it, taken up at 9am" (eaten_at is set by EatenSheet)
+function eatenLine(d) {
+  const t = typeof d.eaten === "number" && d.eaten_at ? clock(new Date(d.eaten_at)) : null;
+  if (!t) return eatenText(d.eaten);
+  return d.eaten > 0 ? `${eatenText(d.eaten)} at ${t}` : `${eatenText(d.eaten)}, taken up at ${t}`;
+}
+
 // Breakfast before 11am, dinner from 3pm, lunch in between (as bt-push says it)
 const mealName = (at) => { const h = new Date(at).getHours(); return h < 11 ? "Breakfast" : h >= 15 ? "Dinner" : "Lunch"; };
 
@@ -197,7 +213,7 @@ const mealName = (at) => { const h = new Date(at).getHours(); return h < 11 ? "B
 function describe(log, store) {
   const d = log.details || {};
   switch (log.kind) {
-    case "fed": return { title: PORTION_LABEL[d.portion] || "Meal", sub: eatenText(d.eaten) };
+    case "fed": return { title: PORTION_LABEL[d.portion] || "Meal", sub: eatenLine(d) };
     case "water": return { title: "Water topped up" };
     case "wee": return { title: "Wee" };
     case "poo": return { title: "Poo" };
@@ -1067,6 +1083,8 @@ function TodayScreen({ store, open, onLogged, photo, wx, tides }) {
   const hour = new Date().getHours();
   const todays = logs.filter((l) => dayKey(new Date(l.at)) === today);
   const meals = todays.filter((l) => l.kind === "fed").length;
+  // His food's down: today's latest meal, not ticked yet. The Fed tile then asks how much he ate.
+  const down = foodDown(logs);
   const walkMins = todays.filter((l) => l.kind === "walk").reduce((n, l) => n + (Number(l.details && l.details.mins) || 0), 0);
   const daycare = todays.some((l) => l.kind === "daycare");
   const where = whereNow(store);
@@ -1094,7 +1112,10 @@ function TodayScreen({ store, open, onLogged, photo, wx, tides }) {
   else walkLine = last(["walk", "daycare"]) ? `Last walk ${lowerAgo(last(["walk", "daycare"]).at)}` : "No walks logged yet";
 
   const tiles = [
-    { kind: "fed", label: "Fed", line: sinceText(["fed"]), note: fedNote, urgent: fedUrgent, onClick: () => quick("fed", { portion: "full", eaten: null }) },
+    down
+      ? { kind: "fed", label: "Fed", line: `Down since ${clock(new Date(down.at))}`, note: "Tap when he's eaten", waiting: true,
+          aria: `Say how much he ate. His food went down at ${clock(new Date(down.at))}`, onClick: () => open({ type: "eaten", log: down }) }
+      : { kind: "fed", label: "Fed", line: sinceText(["fed"]), note: fedNote, urgent: fedUrgent, onClick: () => quick("fed", { portion: "full", eaten: null }) },
     { kind: "water", label: "Water", line: sinceText(["water"]), onClick: () => quick("water") },
     { kind: "wee", label: "Wee", line: sinceText(["wee"]), onClick: () => quick("wee") },
     { kind: "poo", label: "Poo", line: sinceText(["poo"]), onClick: () => quick("poo") },
@@ -1118,8 +1139,8 @@ function TodayScreen({ store, open, onLogged, photo, wx, tides }) {
 
       <section className="tiles" aria-label="Log in one tap">
         {tiles.map((t) => (
-          <button key={t.kind} type="button" className={`tile ${flash === t.kind ? "is-logged" : ""} ${t.urgent ? "is-urgent" : ""}`} onClick={t.onClick}
-            aria-label={`Log ${t.label.toLowerCase()}. Last: ${t.line}`}>
+          <button key={t.kind} type="button" className={`tile ${flash === t.kind ? "is-logged" : ""} ${t.urgent ? "is-urgent" : ""} ${t.waiting ? "is-waiting" : ""}`} onClick={t.onClick}
+            aria-label={t.aria || `Log ${t.label.toLowerCase()}. Last: ${t.line}`}>
             <span className="tile-icon"><Icon name={flash === t.kind ? "check" : KIND[t.kind].icon} size={30} stroke={1.9} /></span>
             <span className="tile-label">{t.label}</span>
             <span className="tile-line">{t.line}</span>
@@ -1139,20 +1160,6 @@ function TodayScreen({ store, open, onLogged, photo, wx, tides }) {
       </section>
 
       <WalkSuggestion store={store} wx={wx} tides={tides} />
-
-      {todays.filter((l) => l.kind === "fed" && typeof (l.details || {}).eaten !== "number").map((l) => (
-        <section key={l.id} className="block eat-check" aria-label="How much did he eat?">
-          <p className="eat-q"><Icon name="bowl" size={22} /><span>{mealName(l.at)} went down at {clock(new Date(l.at))}. How much did he eat?</span></p>
-          <div className="choices">
-            {EATEN.map((e) => (
-              <button key={e.key} type="button" className="choice" onClick={() => {
-                store.updateLog(l.id, { details: { ...(l.details || {}), eaten: e.key } });
-                toast(e.key === 0 ? `${mealName(l.at)} not eaten` : `${mealName(l.at)}: ${eatenText(e.key).toLowerCase()}`);
-              }}>{e.label}</button>
-            ))}
-          </div>
-        </section>
-      ))}
 
       <button type="button" className="btn btn-quiet btn-block" onClick={() => open({ type: "add" })}>
         <Icon name="plus" size={20} /> Log something else
@@ -1711,7 +1718,7 @@ function Notifications({ store }) {
             <li>8am: flea or worming due or overdue, food to buy, appointments that day</li>
             <li>12pm: if no meal has been logged</li>
             <li>4pm: if he hasn't been walked or gone to daycare</li>
-            <li>6pm: if no dinner has been logged</li>
+            <li>6pm: if no dinner has been logged, unless his food's still down</li>
           </ul>
           <p className="fineprint">Once they're on, you can choose which of these this phone gets.</p>
         </>
@@ -2083,6 +2090,7 @@ function LogSheet({ store, kind, log, onClose }) {
   const [when, setWhen] = useState(dateOnly ? dayKey(initial) : toLocalInput(initial));
   const [d, setD] = useState(() => ({ ...defaultsFor(kind), ...((log && log.details) || {}) }));
   const [note, setNote] = useState((log && log.note) || "");
+  const [ateWhen, setAteWhen] = useState(() => (log && log.details && log.details.eaten_at ? toLocalInput(new Date(log.details.eaten_at)) : ""));
   const set = (patch) => setD((x) => ({ ...x, ...patch }));
   const medNames = useMemo(() => [...new Set(store.logs.filter((l) => l.kind === "med" && l.details && l.details.name).map((l) => l.details.name))], [store.logs]);
   const latestKg = (latestOf(store.logs, ["weight"]) || {}).details;
@@ -2102,6 +2110,10 @@ function LogSheet({ store, kind, log, onClose }) {
     if (kind === "weight") out.kg = Number(d.kg);
     if (kind === "walk") { out.mins = Number(d.mins); out.distance = String(d.distance || "").trim(); }
     if (kind === "med") { out.name = String(d.name).trim(); out.dose = String(d.dose || "").trim(); }
+    if (kind === "fed") {
+      const t = ateWhen ? new Date(ateWhen) : null;
+      if (typeof out.eaten === "number" && t && !isNaN(t)) out.eaten_at = t.toISOString(); else delete out.eaten_at;
+    }
     return out;
   };
   const save = (e) => {
@@ -2125,6 +2137,11 @@ function LogSheet({ store, kind, log, onClose }) {
           <>
             <Choices label="Portion" options={PORTIONS} value={d.portion} onChange={(v) => set({ portion: v })} />
             <Choices label="How much did he eat?" options={EATEN} value={d.eaten} onChange={(v) => set({ eaten: v })} />
+            {typeof d.eaten === "number" && (
+              <Field label={d.eaten === 0 ? "When was it taken up? (optional)" : "When did he eat it? (optional)"} id="ate-when">
+                <input id="ate-when" className="input" type="datetime-local" value={ateWhen} onChange={(e) => setAteWhen(e.target.value)} />
+              </Field>
+            )}
           </>
         )}
         {kind === "walk" && (
@@ -2162,6 +2179,40 @@ function LogSheet({ store, kind, log, onClose }) {
         <button type="submit" className="btn btn-primary btn-block" disabled={!valid}>{editing ? "Save changes" : `Log ${k.title.toLowerCase()}`}</button>
         {editing && <ConfirmButton label="Delete entry" confirmLabel="Tap again to delete" onConfirm={remove} />}
         {editing && whoOf(store, log) && <p className="fineprint">Logged by {whoOf(store, log)}</p>}
+      </form>
+    </Sheet>
+  );
+}
+
+// His food's down: how much he ate, and when (or when it was taken up)
+function EatenSheet({ store, log, onClose, onLogged }) {
+  const live = store.logs.find((l) => l.id === log.id) || log;
+  const went = new Date(live.at);
+  const [eaten, setEaten] = useState(null);
+  const [time, setTime] = useState(() => { const n = new Date(); return `${pad(n.getHours())}:${pad(n.getMinutes())}`; });
+  const at = new Date(`${dayKey(went)}T${time}:00`);
+  const problem = !/^\d{2}:\d{2}/.test(time) || isNaN(at) ? "Pick a time."
+    : at.getTime() < went.getTime() - 60000 ? `That's before it went down at ${clock(went)}.`
+    : at.getTime() > Date.now() + 5 * 60000 ? "That's later than now." : null;
+  const who = whoOf(store, live);
+  const save = (e) => {
+    e.preventDefault();
+    if (eaten == null || problem) return;
+    store.updateLog(live.id, { details: { ...(live.details || {}), eaten, eaten_at: at.toISOString() } });
+    toast(eaten === 0 ? `${mealName(live.at)} not eaten` : `${mealName(live.at)}: ${eatenText(eaten).toLowerCase()}`);
+    onClose();
+  };
+  const another = () => { onLogged(store.addLog("fed", { portion: "full", eaten: null })); onClose(); };
+  return (
+    <Sheet title={`${mealName(live.at)}`} onClose={onClose}>
+      <form className="sheet-body" onSubmit={save}>
+        <p className="block-note">{`${PORTION_LABEL[(live.details || {}).portion] || "Food"} went down at ${clock(went)}${who ? `, by ${who}` : ""}.`}</p>
+        <Choices label="How much did he eat?" options={EATEN} value={eaten} onChange={setEaten} />
+        <Field label={eaten === 0 ? "When was it taken up?" : "When did he eat it?"} id="eaten-time" hint={problem}>
+          <input id="eaten-time" className="input input-short" type="time" value={time} onChange={(e) => setTime(e.target.value)} required />
+        </Field>
+        <button type="submit" className="btn btn-primary btn-block" disabled={eaten == null || !!problem}>Save</button>
+        <button type="button" className="link-more" onClick={another}>Put down another meal</button>
       </form>
     </Sheet>
   );
@@ -2915,6 +2966,9 @@ function Main({ session }) {
         sheetEl = sheet.log && !live ? null : <LogSheet key={(sheet.log && sheet.log.id) || sheet.kind} store={store} kind={sheet.kind} log={live} onClose={close} />;
         break;
       }
+      case "eaten":
+        sheetEl = <EatenSheet key={sheet.log.id} store={store} log={sheet.log} onClose={close} onLogged={onLogged} />;
+        break;
       case "walk":
         sheetEl = <WalkSheet store={store} onClose={close} onLogged={onLogged} onDone={sheet.onDone} openDetails={() => setSheet({ type: "log", kind: "walk" })} />;
         break;

@@ -114,7 +114,7 @@ async function speak(admin: Admin, today: string, dayStart: string) {
 }
 
 const MEAL_EATEN = (e: unknown) =>
-  typeof e !== "number" ? "nobody's said yet how much he ate"
+  typeof e !== "number" ? "his food's still down"
     : e >= 100 ? "he ate all of it" : e >= 75 ? "he ate most of it" : e >= 50 ? "he ate half" : e > 0 ? "he ate a little" : "he didn't eat it";
 
 async function summaryText(admin: Admin, today: string, dayStart: string, set: Record<string, any>) {
@@ -127,7 +127,10 @@ async function summaryText(admin: Admin, today: string, dayStart: string, set: R
   const out: string[] = [];
   if (meal.data) {
     const at = new Date(meal.data.at);
-    out.push(`His last meal was ${mealWord(at)}, ${when(at, today)}, and ${MEAL_EATEN(meal.data.details?.eaten)}.`);
+    const d = meal.data.details ?? {};
+    // When he ate it, if someone said (EatenSheet in the app)
+    const ateAt = typeof d.eaten === "number" && d.eaten > 0 && d.eaten_at ? ` at ${clock(new Date(d.eaten_at))}` : "";
+    out.push(`His last meal was ${mealWord(at)}, ${when(at, today)}, and ${MEAL_EATEN(d.eaten)}${ateAt}.`);
   } else out.push("No meals are logged yet.");
   const toilet = [wee.data && `his last wee was ${when(new Date(wee.data.at), today)}`, poo.data && `his last poo was ${when(new Date(poo.data.at), today)}`].filter(Boolean);
   if (toilet.length) out.push(cap(toilet.join(", and ")) + ".");
