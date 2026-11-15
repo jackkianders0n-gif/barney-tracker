@@ -10,7 +10,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 // ---------------------------------------------------------------------------
 const SUPABASE_URL = "https://wvedhcuebfdfkhfvphlb.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_bkeGnvruQEz3MsVDZiJ03g_bhXXDjgC";
-const APP_VERSION = "2.8.0";
+const APP_VERSION = "2.8.1";
 // The old Cloudflare app, read once by Barney → Settings → Bring over data from the old app
 const OLD_API = "https://barney-tracker-api.barneythebigdog.workers.dev";
 
@@ -238,7 +238,7 @@ const uuid = () => (crypto.randomUUID
 const savedWalksOf = (store) => (Array.isArray(store.settings.walks) ? store.settings.walks : []);
 const sameName = (a, b) => String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
 // What to store for a place: a saved walk's own spelling if it is one, else what was typed
-function placeOf(store, text) {
+function walkPlace(store, text) {
   const t = String(text || "").trim();
   const w = t && savedWalksOf(store).find((x) => sameName(x.name, t));
   return w ? w.name : t;
@@ -1434,7 +1434,7 @@ function WalkHistory({ store, open }) {
   let unsaid = 0;
   for (const l of logs) {
     if (l.kind !== "walk" || new Date(l.at).getTime() < since) continue;
-    const name = placeOf(store, l.details && l.details.route);
+    const name = walkPlace(store, l.details && l.details.route);
     if (!name) { unsaid++; continue; }
     const k = name.toLowerCase();
     tally.set(k, { name: (tally.get(k) || {}).name || name, n: ((tally.get(k) || {}).n || 0) + 1 });
@@ -2248,7 +2248,7 @@ function LogSheet({ store, kind, log, preset, onClose }) {
     if (kind === "weight") out.kg = Number(d.kg);
     if (kind === "walk") {
       out.mins = Number(d.mins); out.distance = String(d.distance || "").trim();
-      const route = placeOf(store, where);
+      const route = walkPlace(store, where);
       if (route) out.route = route; else delete out.route;
     }
     if (kind === "med") { out.name = String(d.name).trim(); out.dose = String(d.dose || "").trim(); }
@@ -2373,7 +2373,7 @@ function WalkSheet({ store, onClose, onLogged, openDetails, onDone }) {
     onClose();
   };
   const logWalk = (mins) => {
-    const route = placeOf(store, where);
+    const route = walkPlace(store, where);
     log("walk", route ? { mins, distance: "", route } : { mins, distance: "" });
     if (route && keep) addSavedWalk(store, route, mins);
   };
