@@ -396,11 +396,12 @@ input[type="date"].input, input[type="time"].input, input[type="datetime-local"]
 /* ---------------------------------------------------------------------------
    Diary
    --------------------------------------------------------------------------- */
+/* Sticks just below the status bar. It used to fill the status bar with cream,
+   but that padding covered the bottom of the collar before you'd scrolled. */
 .filters {
-  display: flex; gap: 8px; overflow-x: auto; margin: 0 -16px; padding: 0 16px 4px;
-  scrollbar-width: none; position: sticky; top: 0; z-index: 5;
+  display: flex; gap: 8px; overflow-x: auto; margin: -6px -16px 0; padding: 6px 16px 4px;
+  scrollbar-width: none; position: sticky; top: var(--safe-top); z-index: 5;
   background: linear-gradient(var(--cream) 80%, rgba(251, 244, 234, 0));
-  padding-top: calc(var(--safe-top) + 6px); margin-top: calc(-1 * var(--safe-top) - 6px);
 }
 .filters::-webkit-scrollbar { display: none; }
 .filters .choice { flex-shrink: 0; }
