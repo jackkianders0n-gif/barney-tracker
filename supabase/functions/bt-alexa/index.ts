@@ -11,6 +11,8 @@
 // SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are provided automatically.
 
 import { createClient } from "npm:@supabase/supabase-js@2";
+// The same tide predictor the app uses: tide-predictor.js in the repo is this file with a licence header
+import { useStation as stationPredictor } from "https://cdn.jsdelivr.net/npm/@neaps/tide-predictor@0.11.0/+esm";
 
 type Admin = ReturnType<typeof createClient>;
 
@@ -105,7 +107,7 @@ Deno.serve(async (req: Request) => {
 // What Alexa says
 
 async function speak(admin: Admin, today: string, dayStart: string) {
-  const settingsRows = await admin.from("bt_settings").select("key, value").in("key", ["walks", "walk_area", "tides", "treatments", "daycares"]);
+  const settingsRows = await admin.from("bt_settings").select("key, value").in("key", ["walks", "walk_area", "tide_stations", "treatments", "daycares"]);
   const set: Record<string, any> = Object.fromEntries((settingsRows.data ?? []).map((r: any) => [r.key, r.value]));
   const [summary, walk, care] = await Promise.all([summaryText(admin, today, dayStart, set), walkText(set), careText(admin, today, set)]);
   return { summary, walk, care };
@@ -163,18 +165,18 @@ async function walkText(set: Record<string, any>) {
   const area = set.walk_area;
   if (!walks.length || !area?.lat) return "There are no walks set up yet. Add them in the app's Walks tab.";
   const wx = await weather(area.lat, area.lon);
-  const tides = set.tides ?? {};
-  const eventsFor = (w: any) => tides.stations?.[tides.walk_station?.[w.id] ?? tides.area_station]?.events ?? [];
   const now = Date.now();
+  const tideFor = tideMaker(set.tide_stations?.stations ?? {}, area, now);
   const later: number[] = [];
   for (let t = Math.ceil(now / 1800000) * 1800000; t <= now + 12 * 3600000; t += 1800000) {
     const hr = Number(parts(new Date(t)).hour);
     if (t > now && hr >= 6 && hr <= 21) later.push(t);
   }
   const plan = walks.map((w) => {
-    const nowJ = judge(w, now, wx, eventsFor(w));
+    const tide = tideFor(w);
+    const nowJ = judge(w, now, wx, tide);
     let best: { t: number; j: ReturnType<typeof judge> } | null = null;
-    for (const t of later) { const j = judge(w, t, wx, eventsFor(w)); if (j.ok && (!best || j.score > best.j.score)) best = { t, j }; }
+    for (const t of later) { const j = judge(w, t, wx, tide); if (j.ok && (!best || j.score > best.j.score)) best = { t, j }; }
     return { w, now: nowJ, best };
   }).sort((a, b) => (Number(b.now.ok) - Number(a.now.ok)) || (b.now.score - a.now.score));
   const top = plan.find((p) => p.now.ok);
@@ -209,18 +211,75 @@ async function weather(lat: number, lon: number): Promise<Wx> {
   } catch { return null; }
 }
 
-function tideAt(events: any[], t: number) {
-  const i = events.findIndex((e) => Date.parse(e.at) > t);
-  if (i <= 0) return null;
-  const prev = events[i - 1], next = events[i];
-  const a = Date.parse(prev.at), b = Date.parse(next.at);
-  const p = Math.min(1, Math.max(0, (t - a) / (b - a)));
-  const rising = prev.type === "low";
-  return { level: rising ? (1 - Math.cos(Math.PI * p)) / 2 : (1 + Math.cos(Math.PI * p)) / 2, rising };
+// Tides: the same rules as the app (useTides, tideStationFor, tideLineOf and
+// judgeWalk in app.jsx). Heights in metres above Lowest Astronomical Tide, from the
+// TICON-4 constants in bt_settings.tide_stations.
+const TIDE_STEP = 10 * 60000;
+type Tide = { series: { from: number; levels: number[] }; mean: { lw: number; hw: number }; line: number };
+function kmBetween(aLat: number, aLon: number, bLat: number, bLon: number) {
+  const x = (bLon - aLon) * Math.cos(((aLat + bLat) / 2) * Math.PI / 180), y = bLat - aLat;
+  return Math.sqrt(x * x + y * y) * 111.2;
 }
-const tideWord = (x: { level: number; rising: boolean }) => (x.level < 0.35 ? "out" : x.level > 0.65 ? "in" : x.rising ? "coming in" : "going out");
+function nearestStation(stations: Record<string, any>, lat: number, lon: number): string | null {
+  let best: string | null = null, km = Infinity;
+  for (const [key, st] of Object.entries(stations)) { const d = kmBetween(lat, lon, st.latitude, st.longitude); if (d < km) { km = d; best = key; } }
+  return best;
+}
+function tideStationFor(walk: any, area: any, stations: Record<string, any>): string | null {
+  if (walk?.station_id && stations[walk.station_id]) return walk.station_id;
+  if (walk?.lat != null && walk?.lon != null) return nearestStation(stations, walk.lat, walk.lon);
+  if (area?.station_id && stations[area.station_id]) return area.station_id;
+  if (area?.lat != null && area?.lon != null) return nearestStation(stations, area.lat, area.lon);
+  return null;
+}
+function meanTides(st: any) {
+  const d = st.datums ?? {}, lat = Number(d.LAT) || 0;
+  return { lw: Number(d.MLW) - lat, hw: Number(d.MHW) - lat };
+}
+function tideLineOf(walk: any, st: any): number {
+  if (typeof walk.tide_height === "number" && Number.isFinite(walk.tide_height)) return walk.tide_height;
+  const m = meanTides(st);
+  return Math.round((m.lw + (walk.tide === "high" ? 0.6 : 0.4) * (m.hw - m.lw)) * 10) / 10;
+}
+// Heights every 10 minutes for the next day and a half at each station, and each walk's line
+function tideMaker(stations: Record<string, any>, area: any, now: number) {
+  const made: Record<string, { series: Tide["series"]; mean: Tide["mean"] } | null> = {};
+  return (walk: any): Tide | null => {
+    const key = tideStationFor(walk, area, stations);
+    if (!key) return null;
+    if (!(key in made)) {
+      try {
+        const tl = stationPredictor(stations[key], 0).getTimelinePrediction({ start: new Date(now - 3600000), end: new Date(now + 36 * 3600000), timeFidelity: TIDE_STEP / 1000 }).timeline;
+        made[key] = { series: { from: tl.length ? tl[0].time.getTime() : now, levels: tl.map((p: any) => p.level) }, mean: meanTides(stations[key]) };
+      } catch (e) { console.error("tide station", key, e); made[key] = null; }
+    }
+    const m = made[key];
+    return m ? { ...m, line: tideLineOf(walk, stations[key]) } : null;
+  };
+}
+function levelAt(series: Tide["series"], t: number): number | null {
+  const x = (t - series.from) / TIDE_STEP, i = Math.floor(x);
+  if (i < 0 || i + 1 >= series.levels.length) return null;
+  return series.levels[i] + (x - i) * (series.levels[i + 1] - series.levels[i]);
+}
+function tideAt(tide: Tide, t: number) {
+  const level = levelAt(tide.series, t), soon = levelAt(tide.series, t + TIDE_STEP);
+  if (level == null) return null;
+  return { level, rising: soon != null && soon > level, frac: (level - tide.mean.lw) / (tide.mean.hw - tide.mean.lw) };
+}
+function tideSpan(tide: Tide, a: number, b: number) {
+  let lo = Infinity, hi = -Infinity;
+  for (let t = a; ; t = Math.min(b, t + TIDE_STEP / 2)) {
+    const l = levelAt(tide.series, t);
+    if (l == null) return null;
+    lo = Math.min(lo, l); hi = Math.max(hi, l);
+    if (t >= b) break;
+  }
+  return { lo, hi };
+}
+const tideWord = (x: { frac: number; rising: boolean }) => (x.frac < 0.35 ? "out" : x.frac > 0.65 ? "in" : x.rising ? "coming in" : "going out");
 
-function judge(walk: any, t: number, wx: Wx, events: any[]) {
+function judge(walk: any, t: number, wx: Wx, tide: Tide | null) {
   const mins = Number(walk.mins) || 30;
   const end = t + mins * 60000;
   const no: string[] = [], minus: string[] = [], plus: string[] = [];
@@ -228,10 +287,13 @@ function judge(walk: any, t: number, wx: Wx, events: any[]) {
   const day = wx?.days.find((d) => d.day === new Date(t).toISOString().slice(0, 10));
   if (walk.daylight && day && (t < day.sunrise || end > day.sunset)) no.push("dark");
   if (walk.tide === "low" || walk.tide === "high") {
-    const a = tideAt(events, t), b = tideAt(events, end);
-    if (a) {
-      if (walk.tide === "low") { if (Math.max(a.level, b ? b.level : a.level) > 0.4) no.push(`the tide's ${tideWord(a)}`); else { plus.push("The tide's out"); score += 10; } }
-      else if (Math.min(a.level, b ? b.level : a.level) < 0.6) no.push(`the tide's ${tideWord(a)}`); else { plus.push("The tide's in"); score += 10; }
+    const a = tide && tideAt(tide, t), span = tide && tideSpan(tide, t, end);
+    if (a && span) {
+      if (walk.tide === "low") {
+        if (span.hi > tide!.line) no.push(a.level <= tide!.line ? "the tide's coming in" : a.frac < 0.35 ? "the tide isn't out far enough" : `the tide's ${tideWord(a)}`);
+        else { plus.push("The tide's out"); score += 10; }
+      } else if (span.lo < tide!.line) no.push(a.level >= tide!.line ? "the tide's going out" : a.frac > 0.65 ? "the tide isn't in far enough" : `the tide's ${tideWord(a)}`);
+      else { plus.push("The tide's in"); score += 10; }
     }
   }
   const i = wx ? wx.hours.findIndex((x) => x.t > t) : -1;

@@ -364,6 +364,10 @@ input[type="date"].input, input[type="time"].input, input[type="datetime-local"]
 .tide-state { font-weight: 700; color: var(--tan-ink); text-align: right; }
 .tide-next { grid-column: 1 / -1; font-size: 14px; color: var(--ink-soft); }
 .cond-line.is-error { color: var(--alert); }
+.tide-line { align-items: center; margin-bottom: 4px; }
+.tide-height { flex: 1; text-align: center; font-family: var(--display); font-weight: 700; font-size: 24px; color: var(--navy); }
+.link-inline { display: inline; margin: 0; padding: 0; font-size: inherit; }
+.tide-line + .field-hint + .btn { margin-top: 10px; }
 .tide-times { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .tide-time { display: flex; flex-direction: column; padding: 6px 10px; border-radius: 12px; background: var(--apricot-soft); font-size: 13px; }
 .tide-time b { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--tan-ink); }

@@ -10,7 +10,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 // ---------------------------------------------------------------------------
 const SUPABASE_URL = "https://wvedhcuebfdfkhfvphlb.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_bkeGnvruQEz3MsVDZiJ03g_bhXXDjgC";
-const APP_VERSION = "2.5.0";
+const APP_VERSION = "2.6.0";
 // The old Cloudflare app, read once by Barney → Settings → Bring over data from the old app
 const OLD_API = "https://barney-tracker-api.barneythebigdog.workers.dev";
 
@@ -590,12 +590,17 @@ const whoOf = (store, log) => {
 
 // ---------------------------------------------------------------------------
 // Walks: which of your walks suits the weather (Open-Meteo, fetched by the
-// phone) and the tide (official UK tide times through bt-tides).
-// bt_settings.walks: [{ id, name, mins, tide: any|low|high, muddy, exposed, shady, daylight }]
-// bt_settings.walk_area: { name, lat, lon, station_id, station_name }
-// bt_settings.tides: { sig, fetched_at, area_station, walk_station: { walkId: stationId },
-//   stations: { stationId: { name, events: [{ type: high|low, at, height }] } } } (written by bt-tides)
-// Each tide walk uses its own station: picked for it, else nearest the walk, else the area's.
+// phone) and the tide (worked out on the phone too: see useTides).
+// bt_settings.walks: [{ id, name, mins, tide: any|low|high, tide_height?, muddy, exposed, shady, daylight, lat?, lon?, station_id? }]
+//   tide_height: metres above Lowest Astronomical Tide. Low walks are good while the
+//   tide stays below it for the whole walk, high walks while it stays above.
+//   Not set: tideLineDefault() for the walk's station.
+// bt_settings.walk_area: { name, lat, lon, station_id }
+// bt_settings.tide_stations: { stations: { key: { name, latitude, longitude, chart_datum, datums,
+//   licence, attribution, harmonic_constituents } } }: TICON-4 constants for the nearby tide
+//   gauges, put in by hand with SQL so where we walk stays out of this public repo.
+// Each tide walk uses its own station: picked for it, else nearest the walk, else the
+// area's, else the one nearest the area.
 // ---------------------------------------------------------------------------
 const WALK_TIDES = [{ key: "any", label: "Any tide" }, { key: "low", label: "Only when it's out" }, { key: "high", label: "Best when it's in" }];
 const WEATHER_KEY = "bt-weather-v1";
@@ -653,63 +658,126 @@ function useWeather(area) {
   return wx;
 }
 
-// The same string as tidesSig() in bt-tides: when it changes, tides are fetched again
-function tidesSig(area, walks) {
-  const w = (walks || []).filter((x) => x && (x.tide === "low" || x.tide === "high"))
-    .map((x) => `${x.id}:${x.station_id || ""}:${x.lat == null ? "" : x.lat}:${x.lon == null ? "" : x.lon}`).join(",");
-  return `${(area && area.station_id) || ""}|${w}`;
+// --- Tides. The same rules are repeated in bt-alexa (keep them in step). ---
+const TIDE_STEP = 10 * 60000;
+const tideStationsOf = (settings) => (settings && settings.tide_stations && settings.tide_stations.stations) || {};
+// Near enough for picking the closest gauge
+function kmBetween(aLat, aLon, bLat, bLon) {
+  const x = (bLon - aLon) * Math.cos(((aLat + bLat) / 2) * Math.PI / 180), y = bLat - aLat;
+  return Math.sqrt(x * x + y * y) * 111.2;
+}
+function nearestStation(stations, lat, lon) {
+  let best = null, km = Infinity;
+  for (const [key, st] of Object.entries(stations)) {
+    const d = kmBetween(lat, lon, st.latitude, st.longitude);
+    if (d < km) { km = d; best = key; }
+  }
+  return best;
+}
+// Which station a walk's tides come from (walk can be null for the area's)
+function tideStationFor(walk, area, stations) {
+  if (walk && walk.station_id && stations[walk.station_id]) return walk.station_id;
+  if (walk && walk.lat != null && walk.lon != null) return nearestStation(stations, walk.lat, walk.lon);
+  if (area && area.station_id && stations[area.station_id]) return area.station_id;
+  if (area && area.lat != null && area.lon != null) return nearestStation(stations, area.lat, area.lon);
+  return null;
+}
+// A station's average low and high water, in metres above LAT
+function meanTides(st) {
+  const d = st.datums || {}, lat = Number(d.LAT) || 0;
+  return { lw: Number(d.MLW) - lat, hw: Number(d.MHW) - lat };
+}
+// Before it's set for a walk: the old rule (the bottom 40% of the tide, or the top
+// 40% for high walks) on an average tide, to the nearest 10cm
+function tideLineDefault(walk, st) {
+  const m = meanTides(st);
+  return Math.round((m.lw + (walk.tide === "high" ? 0.6 : 0.4) * (m.hw - m.lw)) * 10) / 10;
+}
+const hasTideLine = (walk) => typeof walk.tide_height === "number" && Number.isFinite(walk.tide_height);
+const tideLineOf = (walk, st) => (hasTideLine(walk) ? walk.tide_height : tideLineDefault(walk, st));
+const metres = (h) => `${(Math.round(h * 10) / 10).toFixed(1)}m`;
+
+// Predicted heights every 10 minutes for one station
+function tideSeries(tp, st, from, to) {
+  const tl = tp.useStation(st, 0).getTimelinePrediction({ start: new Date(from), end: new Date(to), timeFidelity: TIDE_STEP / 1000 }).timeline;
+  return { from: tl.length ? tl[0].time.getTime() : from, levels: tl.map((p) => p.level) };
+}
+function levelAt(series, t) {
+  const x = (t - series.from) / TIDE_STEP, i = Math.floor(x);
+  if (i < 0 || i + 1 >= series.levels.length) return null;
+  return series.levels[i] + (x - i) * (series.levels[i + 1] - series.levels[i]);
+}
+// The tide at a moment: its height, whether it's rising, and how far in it is
+// (frac 0 = an average low water, 1 = an average high water)
+function tideAt(tide, t) {
+  const level = levelAt(tide.series, t), soon = levelAt(tide.series, t + TIDE_STEP);
+  if (level == null) return null;
+  return { level, rising: soon != null && soon > level, frac: (level - tide.mean.lw) / (tide.mean.hw - tide.mean.lw) };
+}
+// Lowest and highest it gets between two moments
+function tideSpan(tide, a, b) {
+  let lo = Infinity, hi = -Infinity;
+  for (let t = a; ; t = Math.min(b, t + TIDE_STEP / 2)) {
+    const l = levelAt(tide.series, t);
+    if (l == null) return null;
+    lo = Math.min(lo, l); hi = Math.max(hi, l);
+    if (t >= b) break;
+  }
+  return { lo, hi };
+}
+const tideWord = (s) => (s.frac < 0.35 ? "out" : s.frac > 0.65 ? "in" : s.rising ? "coming in" : "going out");
+
+// The predictor, once index.html has loaded it
+function useTidePredictor() {
+  const [tp, setTp] = useState(() => window.btTide || null);
+  useEffect(() => {
+    if (tp) return undefined;
+    const on = () => { if (window.btTide) setTp(window.btTide); };
+    window.addEventListener("bt-tide-ready", on);
+    on();
+    return () => window.removeEventListener("bt-tide-ready", on);
+  }, [tp]);
+  return tp;
 }
 
-// Tide times for every station the walks need: shared through bt_settings.tides,
-// and fetched again by bt-tides once they're 6 hours old or the walks change
+// Tides for the walks, worked out on the phone (Neaps) from the TICON-4 constants in
+// bt_settings.tide_stations: no tide server, and it works without signal.
+// Heights are metres above Lowest Astronomical Tide (about the same as chart datum).
 function useTides(store) {
+  const tp = useTidePredictor();
+  const stations = tideStationsOf(store.settings);
   const area = store.settings.walk_area;
-  const walks = Array.isArray(store.settings.walks) ? store.settings.walks : [];
-  const raw = store.settings.tides;
-  const sig = tidesSig(area, walks);
-  const needed = !!(area && area.station_id) || walks.some((w) => w.tide === "low" || w.tide === "high");
-  const asked = useRef({ at: 0, sig: null });
-  const [error, setError] = useState(null);
-  useEffect(() => {
-    if (!needed || store.offline) return;
-    const stale = !raw || raw.sig !== sig || Date.now() - new Date(raw.fetched_at).getTime() > 6 * 3600000;
-    if (!stale || (asked.current.sig === sig && Date.now() - asked.current.at < 10 * 60000)) return;
-    asked.current = { at: Date.now(), sig };
-    sb.functions.invoke("bt-tides", { body: { action: "events" } })
-      .then(async ({ error: err }) => {
-        if (!err) { setError(null); store.refresh(); return; }
-        let msg = "Couldn't get the tide times.";
-        try { const b = await err.context.json(); if (b && b.error) msg = b.error; } catch (e) { /* keep the plain message */ }
-        setError(msg);
-      })
-      .catch(() => {});
-  }, [sig, needed, raw && raw.fetched_at, store.offline]);
-  const stations = (raw && raw.stations) || {};
-  const stationOf = (walk) => (raw && raw.walk_station && raw.walk_station[walk.id]) || (raw && raw.area_station) || null;
+  const hour = Math.floor(Date.now() / 3600000);
+  const byStation = useMemo(() => {
+    const out = {};
+    if (!tp) return out;
+    const from = (hour - 1) * 3600000, to = from + 48 * 3600000;
+    for (const [key, st] of Object.entries(stations)) {
+      try { out[key] = { key, name: st.name, series: tideSeries(tp, st, from, to), mean: meanTides(st) }; } catch (e) { console.warn("Tide station", key, e); }
+    }
+    return out;
+  }, [tp, store.settings.tide_stations, hour]);
+  const stationOf = (walk) => tideStationFor(walk, area, stations);
+  const forWalk = (walk) => {
+    const key = stationOf(walk), s = key && byStation[key];
+    return s ? { ...s, line: tideLineOf(walk, stations[key]) } : null;
+  };
   return {
-    stations, error,
-    stationOf,
-    eventsFor: (walk) => { const st = stations[stationOf(walk)]; return (st && st.events) || []; },
+    stations, byStation, stationOf, forWalk,
+    error: !Object.keys(stations).length ? "No tide stations are set up yet." : !tp ? "Tide predictions aren't loaded yet." : null,
+    // Where the tide is right now at a walk's station, in metres
+    levelNow: (walk) => { const f = forWalk(walk); return f ? levelAt(f.series, Date.now()) : null; },
+    // High and low waters at a station
+    extremes: (key, from, to) => (tp && stations[key] ? tp.useStation(stations[key], 0).getExtremesPrediction({ start: new Date(from), end: new Date(to) }).extremes : []),
   };
 }
-
-// How far in the tide is at a moment: level 0 = low water, 1 = high water
-function tideAt(events, t) {
-  const i = events.findIndex((e) => new Date(e.at).getTime() > t);
-  if (i <= 0) return null;
-  const prev = events[i - 1], next = events[i];
-  const a = new Date(prev.at).getTime(), b = new Date(next.at).getTime();
-  const p = Math.min(1, Math.max(0, (t - a) / (b - a)));
-  const rising = prev.type === "low";
-  return { level: rising ? (1 - Math.cos(Math.PI * p)) / 2 : (1 + Math.cos(Math.PI * p)) / 2, rising, next };
-}
-const tideWord = (tide) => (tide.level < 0.35 ? "out" : tide.level > 0.65 ? "in" : tide.rising ? "coming in" : "going out");
 const hourOf = (wx, t) => { const i = wx.hours.findIndex((h) => h.t > t); return wx.hours[i > 0 ? i - 1 : i < 0 ? wx.hours.length - 1 : 0] || null; };
 const dayOfWx = (wx, t) => wx.days.find((d) => d.day === dayKey(new Date(t))) || null;
 const rainBefore = (wx, t, hours) => wx.hours.filter((h) => h.t < t && h.t >= t - hours * 3600000).reduce((n, h) => n + h.rain, 0);
 
-// Is this a good time for this walk? no = reasons it's out, minus and plus = notes
-function judgeWalk(walk, t, wx, tides) {
+// Is this a good time for this walk? no = reasons it's out, minus and plus = notes.
+// tide = useTides().forWalk(walk): its station's heights and the walk's tide line.
+function judgeWalk(walk, t, wx, tide) {
   const mins = Number(walk.mins) || 30;
   const end = t + mins * 60000;
   const no = [], minus = [], plus = [];
@@ -720,11 +788,16 @@ function judgeWalk(walk, t, wx, tides) {
     else if (end > d.sunset) no.push(t >= d.sunset ? "Dark" : `Dark by ${clock(new Date(d.sunset))}`);
   }
   if (walk.tide === "low" || walk.tide === "high") {
-    const a = tideAt(tides, t), b = tideAt(tides, end);
-    if (!a) minus.push("Tide times not known");
+    const a = tide && tideAt(tide, t), span = tide && tideSpan(tide, t, end);
+    if (!a || !span) minus.push("Tide times not known");
     else if (walk.tide === "low") {
-      if (Math.max(a.level, b ? b.level : a.level) > 0.4) no.push(`Tide's ${tideWord(a)}`); else { plus.push("Tide's out"); score += 10; }
-    } else if (Math.min(a.level, b ? b.level : a.level) < 0.6) no.push(`Tide's ${tideWord(a)}`); else { plus.push("Tide's in"); score += 10; }
+      // Good while the tide stays below the line for the whole walk
+      if (span.hi > tide.line) no.push(a.level <= tide.line ? "Tide's coming in" : a.frac < 0.35 ? "Tide's not out far enough" : `Tide's ${tideWord(a)}`);
+      else { plus.push("Tide's out"); score += 10; }
+    } else if (span.lo < tide.line) {
+      // High walks: good while it stays above the line
+      no.push(a.level >= tide.line ? "Tide's going out" : a.frac > 0.65 ? "Tide's not in far enough" : `Tide's ${tideWord(a)}`);
+    } else { plus.push("Tide's in"); score += 10; }
   }
   const h = wx && hourOf(wx, t);
   if (h) {
@@ -758,11 +831,11 @@ function walkPlan(store, wx, tideData) {
     if (t > now && hr >= 6 && hr <= 21) later.push(t);
   }
   const list = walks.map((walk) => {
-    const tides = tideData.eventsFor(walk);
-    const nowJ = judgeWalk(walk, now, wx, tides);
+    const tide = tideData.forWalk(walk);
+    const nowJ = judgeWalk(walk, now, wx, tide);
     let best = null;
     for (const t of later) {
-      const j = judgeWalk(walk, t, wx, tides);
+      const j = judgeWalk(walk, t, wx, tide);
       if (j.ok && (!best || j.score > best.j.score)) best = { t, j };
     }
     // Only worth saying if it's better than now
@@ -1177,12 +1250,17 @@ function WalksScreen({ store, open, onLogged, wx, tides }) {
   const h = wx && hourOf(wx, now);
   const d = wx && dayOfWx(wx, now);
   const mud = wx ? Math.round(rainBefore(wx, now, 48)) : null;
-  // A line for each tide station in use
-  const tideLines = Object.entries(tides.stations).map(([id, st]) => {
-    const t = tideAt(st.events || [], now);
-    const next = (st.events || []).filter((e) => new Date(e.at).getTime() > now).slice(0, 2);
-    return { id, name: st.name, t, next };
+  // A line for each tide station in use: the area's, and each tide walk's
+  const inUse = [...new Set([tides.stationOf(null), ...walks.filter((w) => w.tide === "low" || w.tide === "high").map((w) => tides.stationOf(w))])]
+    .filter((key) => key && tides.byStation[key]);
+  const tideLines = inUse.map((key) => {
+    const s = tides.byStation[key];
+    let next = [];
+    try { next = tides.extremes(key, now, now + 30 * 3600000).slice(0, 2); } catch (e) { /* shown without them */ }
+    return { id: key, name: s.name, t: tideAt(s, now), next };
   });
+  const areaStation = tides.stationOf(null) && tides.stations[tides.stationOf(null)];
+  const licences = [...new Set(inUse.map((key) => tides.stations[key].licence).filter(Boolean))];
   const went = (w) => onLogged(store.addLog("walk", { mins: Number(w.mins) || 30, distance: "", route: w.name }));
 
   if (!area) {
@@ -1210,14 +1288,14 @@ function WalksScreen({ store, open, onLogged, wx, tides }) {
         </div>
         {wx && <p className="cond-line">{`${mud}mm of rain in the last 2 days${mud >= 15 ? ", so it'll be muddy" : mud >= 6 ? ", could be muddy" : ""}.`}{d ? ` Sunset ${clock(new Date(d.sunset))}.` : ""}</p>}
         {tideLines.length === 0 ? (
-          <p className="cond-line">{tides.error || (walks.some((w) => w.tide !== "any" && w.tide) || area.station_id ? "Tide times not loaded yet." : "No walks need the tide.")}</p>
+          <p className="cond-line">{tides.error || (walks.some((w) => w.tide !== "any" && w.tide) ? "Tide times not worked out yet." : "No walks need the tide.")}</p>
         ) : (
           <ul className="tide-list">
             {tideLines.map((l) => (
               <li key={l.id}>
                 <span className="tide-name">{l.name}</span>
-                <span className="tide-state">{l.t ? `Tide's ${tideWord(l.t)}` : "–"}</span>
-                <span className="tide-next">{l.next.map((e) => `${e.type === "low" ? "Low" : "High"} ${whenText(new Date(e.at).getTime())}`).join(", ").replace(/, High/, ", high").replace(/, Low/, ", low")}</span>
+                <span className="tide-state">{l.t ? `Tide's ${tideWord(l.t)}, ${metres(l.t.level)}` : "–"}</span>
+                <span className="tide-next">{l.next.map((e) => `${e.low ? "Low" : "High"} ${whenText(e.time.getTime())}, ${metres(e.level)}`).join("; ").replace(/; High/, "; high").replace(/; Low/, "; low")}</span>
               </li>
             ))}
           </ul>
@@ -1249,11 +1327,15 @@ function WalksScreen({ store, open, onLogged, wx, tides }) {
       <section className="block">
         <ul className="list settings">
           <li className="setting">
-            <span className="log-main"><span className="log-title">{area.name}</span><span className="log-sub">{area.station_name ? `Tides: ${area.station_name}` : "No tide station"}</span></span>
+            <span className="log-main"><span className="log-title">{area.name}</span><span className="log-sub">{areaStation ? `Tides: ${areaStation.name}` : "No tide station"}</span></span>
             <button type="button" className="btn btn-small btn-outline" onClick={() => open({ type: "area" })}>Change</button>
           </li>
         </ul>
-        <p className="fineprint">Weather from Open-Meteo. Tide times contain ADMIRALTY® data, © Crown copyright, UK Hydrographic Office. Not for navigation.</p>
+        <p className="fineprint">
+          Weather from Open-Meteo.
+          {inUse.length > 0 && ` Tides worked out with Neaps from TICON-4 tidal constants (Hart-Davis, Dettmering and Seitz, 2025${licences.length ? `; ${licences.join(", ")}` : ""}). Heights are above lowest astronomical tide.`}
+          {" "}Not for navigation.
+        </p>
       </section>
     </main>
   );
@@ -2375,15 +2457,18 @@ function TreatmentSheet({ store, kind, onClose }) {
   );
 }
 
-// Where you walk: a place to get the weather for, and the nearest tide station
+// Where you walk: a place to get the weather for, and its tide station (from
+// the ones in bt_settings.tide_stations, nearest first)
 function AreaSheet({ store, onClose }) {
   const area = store.settings.walk_area || null;
+  const all = tideStationsOf(store.settings);
   const [q, setQ] = useState("");
   const [found, setFound] = useState(null);
   const [place, setPlace] = useState(area);
-  const [stations, setStations] = useState(null);
-  const [stationError, setStationError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const stations = place && place.lat != null ? Object.entries(all)
+    .map(([id, st]) => ({ id, name: st.name, km: Math.round(kmBetween(place.lat, place.lon, st.latitude, st.longitude)) }))
+    .sort((a, b) => a.km - b.km) : [];
   const search = async (e) => {
     e.preventDefault();
     if (!q.trim()) return;
@@ -2398,17 +2483,12 @@ function AreaSheet({ store, onClose }) {
   };
   const pick = async (r) => {
     const p = { name: [r.name, r.admin2 || r.admin1].filter(Boolean).join(", "), lat: Math.round(r.latitude * 1000) / 1000, lon: Math.round(r.longitude * 1000) / 1000 };
-    setPlace(p); setFound(null); setStations(null); setStationError(null);
-    const { data, error } = await sb.functions.invoke("bt-tides", { body: { action: "stations", lat: p.lat, lon: p.lon } });
-    if (error) {
-      let msg = "Couldn't find tide stations.";
-      try { const b = await error.context.json(); if (b && b.error) msg = b.error; } catch (e) { /* keep the plain message */ }
-      setStationError(msg);
-    } else setStations((data && data.stations) || []);
+    setPlace(p); setFound(null);
   };
   const save = async (station) => {
     setBusy(true);
-    const ok = await store.setSetting("walk_area", { ...place, station_id: station ? station.id : null, station_name: station ? station.name : null, stations: stations || [] });
+    const { stations: _old, ...rest } = place;
+    const ok = await store.setSetting("walk_area", { ...rest, station_id: station ? station.id : null, station_name: station ? station.name : null });
     setBusy(false);
     if (ok) { toast("Area saved"); onClose(); }
   };
@@ -2430,20 +2510,19 @@ function AreaSheet({ store, onClose }) {
             ))}
           </ul>
         ))}
-        {place && place !== area && (
+        {place && (place !== area || stations.length > 0) && (
           <>
-            <h3 className="sub-head">Tide station near {place.name.split(",")[0]}</h3>
-            {stationError && <p className="notice notice-error">{stationError}</p>}
-            {stations && (
+            <h3 className="sub-head">Tide station for {place.name.split(",")[0]}</h3>
+            {stations.length === 0 && <p className="block-note">No tide stations are set up yet, so walks can't use the tide.</p>}
+            {stations.length > 0 && (
               <ul className="list">
                 {stations.map((st) => (
                   <li key={st.id}><button type="button" className="log-row" onClick={() => save(st)} disabled={busy}>
-                    <span className="log-main"><span className="log-title">{st.name}</span><span className="log-sub">{st.km} km away</span></span>
+                    <span className="log-main"><span className="log-title">{st.name}{area && place === area && area.station_id === st.id ? " (now)" : ""}</span><span className="log-sub">{st.km} km away</span></span>
                   </button></li>
                 ))}
               </ul>
             )}
-            {!stations && !stationError && <p className="block-note">Finding tide stations…</p>}
             <button type="button" className="link-more" onClick={() => save(null)}>Save without tides</button>
           </>
         )}
@@ -2453,11 +2532,10 @@ function AreaSheet({ store, onClose }) {
 }
 
 function WalkEditSheet({ store, walk, tides, onClose }) {
+  useNow();
   const all = Array.isArray(store.settings.walks) ? store.settings.walks : [];
-  // Tide stations to pick from: the ones near the area and the ones in use
-  const known = new Map();
-  for (const st of ((store.settings.walk_area || {}).stations || [])) known.set(st.id, st.name);
-  for (const [id, st] of Object.entries(tides.stations)) known.set(id, st.name);
+  // Tide stations to pick from: the ones in bt_settings.tide_stations
+  const known = new Map(Object.entries(tides.stations).map(([id, st]) => [id, st.name]));
   const [w, setW] = useState(() => ({ name: "", mins: 30, tide: "any", muddy: false, exposed: false, shady: false, daylight: false, ...(walk || {}) }));
   const [busy, setBusy] = useState(false);
   const set = (patch) => setW((x) => ({ ...x, ...patch }));
@@ -2467,11 +2545,25 @@ function WalkEditSheet({ store, walk, tides, onClose }) {
     setBusy(false);
     if (ok) { toast(msg); onClose(); }
   };
+  const rowOf = (x) => ({ ...x, name: x.name.trim(), mins: Math.max(5, Math.round(Number(x.mins)) || 30), id: x.id || uuid() });
+  const writeRow = (row, msg) => write(walk ? all.map((x) => (x.id === walk.id ? row : x)) : [...all, row], msg);
   const save = (e) => {
     e.preventDefault();
-    const row = { ...w, name: w.name.trim(), mins: Math.max(5, Math.round(Number(w.mins)) || 30), id: w.id || uuid() };
+    const row = rowOf(w);
     if (!row.name) return;
-    write(walk ? all.map((x) => (x.id === walk.id ? row : x)) : [...all, row], "Walk saved");
+    writeRow(row, "Walk saved");
+  };
+  // The height this walk is judged against, and where the tide is now
+  const tideKey = w.tide !== "any" ? tides.stationOf(w) : null;
+  const tideSt = tideKey && tides.stations[tideKey];
+  const line = tideSt ? tideLineOf(w, tideSt) : null;
+  const nowLevel = tideSt ? tides.levelNow(w) : null;
+  const nudge = (by) => set({ tide_height: Math.round((line + by) * 10) / 10 });
+  // At the beach: the water's at the edge of where you can walk, so that's the line
+  const markNow = () => {
+    const row = rowOf({ ...w, tide_height: Math.round(nowLevel * 10) / 10 });
+    if (!row.name) return;
+    writeRow(row, `Saved. ${row.name} is good while the tide's ${row.tide === "high" ? "above" : "below"} ${metres(row.tide_height)}`);
   };
   const Toggle = ({ k, label, hint }) => (
     <label className="toggle">
@@ -2489,10 +2581,30 @@ function WalkEditSheet({ store, walk, tides, onClose }) {
         {w.tide !== "any" && known.size > 0 && (
           <Choices label="Tide times from"
             options={[{ key: null, label: w.lat != null ? "Nearest to the walk" : "The area's station" }, ...[...known].map(([id, name]) => ({ key: id, label: name }))]}
-            value={w.station_id || null} onChange={(v) => set({ station_id: v, station_name: v ? known.get(v) : null })} />
+            value={w.station_id && known.has(w.station_id) ? w.station_id : null} onChange={(v) => set({ station_id: v, station_name: v ? known.get(v) : null })} />
         )}
-        {w.tide !== "any" && walk && !w.station_id && tides.stationOf(walk) && tides.stations[tides.stationOf(walk)] && (
-          <p className="field-hint">Now using {tides.stations[tides.stationOf(walk)].name}.</p>
+        {w.tide !== "any" && !(w.station_id && tides.stations[w.station_id]) && tideSt && (
+          <p className="field-hint">Now using {tideSt.name}.</p>
+        )}
+        {w.tide !== "any" && !tideSt && <p className="field-hint">{tides.error || "Set your area to get the tide."}</p>}
+        {tideSt && (
+          <div className="field">
+            <span className="field-label" id="tide-line-label">{w.tide === "high" ? "Good while the tide's above" : "Good while the tide's below"}</span>
+            <div className="stepper tide-line" role="group" aria-labelledby="tide-line-label">
+              <button type="button" className="step" aria-label="Lower by 10cm" onClick={() => nudge(-0.1)}><Icon name="minus" size={20} /></button>
+              <span className="tide-height" aria-live="polite">{metres(line)}</span>
+              <button type="button" className="step" aria-label="Higher by 10cm" onClick={() => nudge(0.1)}><Icon name="plus" size={20} /></button>
+            </div>
+            <p className="field-hint">
+              {hasTideLine(w) ? "Set for this walk. " : "A starting guess. "}
+              {nowLevel != null && `The tide's at ${metres(nowLevel)} now.`}
+              {hasTideLine(w) && <> <button type="button" className="link-more link-inline" onClick={() => set({ tide_height: null })}>Go back to {metres(tideLineDefault(w, tideSt))}</button></>}
+            </p>
+            <button type="button" className="btn btn-outline btn-block" onClick={markNow} disabled={busy || nowLevel == null || !w.name.trim()}>
+              {w.tide === "high" ? "The tide's just in far enough now" : "The water's at the foot of the shingle now"}
+            </button>
+            <p className="field-hint">Tap this at the beach when the water's at that point: the app saves where the tide is right then.</p>
+          </div>
         )}
         {Toggle({ k: "muddy", label: "Gets muddy after rain" })}
         {Toggle({ k: "exposed", label: "Exposed to the wind", hint: "Avoided in strong gusts" })}
