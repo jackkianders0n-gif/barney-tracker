@@ -145,7 +145,8 @@ async function sendLog(admin: Admin, id: string) {
   await new Promise((r) => setTimeout(r, LOG_DELAY_MS));
   const { data: log } = await admin.from("bt_log").select("*").eq("id", id).maybeSingle();
   if (!log) return { sent: 0, skipped: "undone" };
-  const name = log.created_by ? await memberName(admin, log.created_by) : null;
+  // Logs from the Echo Show card (bt-alexa) have no created_by, just details.by
+  const name = log.created_by ? await memberName(admin, log.created_by) : (typeof log.details?.by === "string" ? log.details.by : null);
   const msg = logMessage(log, name, log.kind === "daycare" ? await daycareName(admin, log.details?.daycare) : null);
   if (!msg) return { sent: 0 };
   const { data: subs } = await admin.from("bt_push_subscriptions").select("*");

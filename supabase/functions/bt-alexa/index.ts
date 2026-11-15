@@ -5,7 +5,13 @@
 // /api/alexa/summary returned, so only the address changes on the Alexa side.
 // The key is in the app: Barney → Settings → Alexa link.
 // Also { speech: { summary, walk, care } }: what the Barney's Tracker Alexa skill
-// (alexa/ in the repo) says, worked out here so the skill never needs changing.
+// (alexa/ in the repo) says, and { card }: what its Echo Show card shows (cardData).
+//
+// POST ?key=<alexa key> with JSON, from taps on the Echo Show card:
+//   { "action": "log", "kind": "fed" | "water" | "wee" | "poo" } → { ok, id, card }
+//   { "action": "eaten", "id": "<meal id>", "eaten": 100 | 75 | 50 | 25 | 0 } → { ok, meal, card }
+//   { "action": "undo", "id": "<id>" } → { ok, card } (only its own logs, for 10 minutes)
+// Logs from the card have details.by = "Echo Show" and no created_by, so everyone is notified.
 //
 // Needs "Verify JWT" turned OFF (Alexa can't sign in); the key protects it.
 // SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are provided automatically.
@@ -20,7 +26,7 @@ const TZ = "Europe/London";
 const CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-alexa-key",
-  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 };
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json", "Cache-Control": "no-store" } });
@@ -30,7 +36,7 @@ const PORTION: Record<string, string> = { full: "Full portion", half: "Half port
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
-  if (req.method !== "GET") return json({ error: "Use GET" }, 405);
+  if (req.method !== "GET" && req.method !== "POST") return json({ error: "Use GET or POST" }, 405);
 
   const url = new URL(req.url);
   const key = req.headers.get("x-alexa-key") ?? url.searchParams.get("key") ?? "";
@@ -44,10 +50,12 @@ Deno.serve(async (req: Request) => {
 
   const today = londonDate(new Date());
   const dayStart = londonMidnight(today).toISOString();
+  if (req.method === "POST") return await act(admin, await req.json().catch(() => null), today, dayStart);
+
   const latest = (kinds: string[]) =>
     admin.from("bt_log").select("*").in("kind", kinds).order("at", { ascending: false }).limit(1).maybeSingle();
 
-  const [feed, wee, poo, food, walks, vet, flea, worm, members, speech] = await Promise.all([
+  const [feed, wee, poo, food, walks, vet, flea, worm, members, speech, card] = await Promise.all([
     latest(["fed", "water"]),
     latest(["wee"]),
     latest(["poo"]),
@@ -58,6 +66,7 @@ Deno.serve(async (req: Request) => {
     latest(["worm"]),
     admin.from("bt_members").select("user_id, display_name"),
     speak(admin, today, dayStart).catch((e) => { console.error(e); return null; }),
+    cardData(admin, today, dayStart).catch((e) => { console.error(e); return null; }),
   ]);
   const names: Record<string, string> = Object.fromEntries((members.data ?? []).map((m: any) => [m.user_id, m.display_name]));
   const by = (row: any) => (row.created_by && names[row.created_by]) || row.details?.by || "App";
@@ -99,9 +108,92 @@ Deno.serve(async (req: Request) => {
     } : null,
     flea: treatment(flea.data),
     worm: treatment(worm.data),
+    card,
     speech: speech ?? { summary: "Sorry, I couldn't get Barney's news just now.", walk: "Sorry, I couldn't work out a walk just now.", care: "Sorry, I couldn't get his treatments just now." },
   });
 });
+
+// ---------------------------------------------------------------------
+// The Echo Show card (alexa/index.js): the app's Today tiles for Fed, Water, Wee and Poo
+
+const ECHO = "Echo Show";
+const ECHO_KINDS = ["fed", "water", "wee", "poo"];
+const EATEN_KEYS = [100, 75, 50, 25, 0];
+
+async function cardData(admin: Admin, today: string, dayStart: string) {
+  const latest = (kind: string) => admin.from("bt_log").select("id, at, details").eq("kind", kind).order("at", { ascending: false }).limit(1).maybeSingle();
+  const [meal, water, wee, poo, meals, walks, plan] = await Promise.all([
+    latest("fed"), latest("water"), latest("wee"), latest("poo"),
+    admin.from("bt_log").select("id", { count: "exact", head: true }).eq("kind", "fed").gte("at", dayStart),
+    admin.from("bt_log").select("kind, details").in("kind", ["walk", "daycare"]).gte("at", dayStart),
+    admin.from("bt_plans").select("place").eq("day", today).eq("place", "daycare").limit(1).maybeSingle(),
+  ]);
+  const m: any = meal.data;
+  // His food's down: today's latest meal, not ticked yet (foodDown() in app.jsx)
+  const down = !!m && londonDate(new Date(m.at)) === today && typeof m.details?.eaten !== "number";
+  const n = meals.count ?? 0;
+  const mins = (walks.data ?? []).filter((w: any) => w.kind === "walk").reduce((t: number, w: any) => t + (Number(w.details?.mins) || 0), 0);
+  const daycare = (walks.data ?? []).some((w: any) => w.kind === "daycare") || !!plan.data;
+  const line = (row: any) => ago(row?.at, today) ?? "Not logged yet";
+  return {
+    fed: {
+      down, id: down ? m.id : null,
+      line: down ? `Down since ${clock(new Date(m.at))}` : line(m),
+      note: down ? "Tap when he's eaten" : n ? `${n} ${n === 1 ? "meal" : "meals"} today` : Number(parts(new Date()).hour) >= 12 ? "No meals yet today" : "",
+    },
+    water: { line: line(water.data) },
+    wee: { line: line(wee.data) },
+    poo: { line: line(poo.data) },
+    walk: mins ? `${mins} minutes of walks today${daycare ? ", plus daycare" : ""}` : daycare ? "At daycare today" : "Not walked yet today",
+  };
+}
+
+// Taps on the card: log one of the four, say how much he ate, or undo the card's own log
+async function act(admin: Admin, body: any, today: string, dayStart: string) {
+  const card = () => cardData(admin, today, dayStart);
+  switch (body?.action) {
+    case "log": {
+      if (!ECHO_KINDS.includes(body.kind)) return json({ error: "Unknown kind" }, 400);
+      const id = crypto.randomUUID();
+      const details = body.kind === "fed" ? { portion: "full", eaten: null, by: ECHO } : { by: ECHO };
+      const { error } = await admin.from("bt_log").insert({ id, kind: body.kind, at: new Date().toISOString(), details });
+      if (error) return json({ error: error.message }, 500);
+      return json({ ok: true, id, card: await card() });
+    }
+    case "eaten": {
+      if (typeof body.id !== "string" || !EATEN_KEYS.includes(body.eaten)) return json({ error: "Bad request" }, 400);
+      const { data: row } = await admin.from("bt_log").select("id, kind, at, details").eq("id", body.id).maybeSingle();
+      if (!row || row.kind !== "fed") return json({ error: "That meal isn't there any more" }, 404);
+      if (typeof row.details?.eaten === "number") return json({ error: "That meal's already been ticked" }, 409);
+      const { error } = await admin.from("bt_log").update({ details: { ...(row.details ?? {}), eaten: body.eaten, eaten_at: new Date().toISOString() } }).eq("id", row.id);
+      if (error) return json({ error: error.message }, 500);
+      return json({ ok: true, meal: mealWord(new Date(row.at)), card: await card() });
+    }
+    case "undo": {
+      if (typeof body.id !== "string") return json({ error: "Missing id" }, 400);
+      const { data: row } = await admin.from("bt_log").select("id, at, details").eq("id", body.id).maybeSingle();
+      if (row) {
+        if (row.details?.by !== ECHO || Date.now() - Date.parse(row.at) > 10 * 60000) return json({ error: "Too late to undo that" }, 409);
+        const { error } = await admin.from("bt_log").delete().eq("id", row.id);
+        if (error) return json({ error: error.message }, 500);
+      }
+      return json({ ok: true, card: await card() });
+    }
+    default: return json({ error: "Unknown action" }, 400);
+  }
+}
+
+// "Just now" / "5 min ago" / "2 hours ago" / "Yesterday, 6pm", as ago() in app.jsx
+function ago(iso: string | undefined, today: string): string | null {
+  if (!iso) return null;
+  const d = new Date(iso), mins = Math.floor((Date.now() - d.getTime()) / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins} min ago`;
+  const days = daysFrom(londonDate(d), today);
+  if (days === 0) { const h = Math.floor(mins / 60); return h === 1 ? "An hour ago" : `${h} hours ago`; }
+  if (days === 1) return `Yesterday, ${clock(d)}`;
+  return `${new Intl.DateTimeFormat("en-GB", { timeZone: TZ, weekday: "long" }).format(d)}, ${clock(d)}`;
+}
 
 // ---------------------------------------------------------------------
 // What Alexa says
