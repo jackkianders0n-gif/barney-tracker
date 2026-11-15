@@ -10,7 +10,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 // ---------------------------------------------------------------------------
 const SUPABASE_URL = "https://wvedhcuebfdfkhfvphlb.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_bkeGnvruQEz3MsVDZiJ03g_bhXXDjgC";
-const APP_VERSION = "2.7.0";
+const APP_VERSION = "2.8.0";
 // The old Cloudflare app, read once by Barney → Settings → Bring over data from the old app
 const OLD_API = "https://barney-tracker-api.barneythebigdog.workers.dev";
 
@@ -233,6 +233,24 @@ const uuid = () => (crypto.randomUUID
   ? crypto.randomUUID()
   : "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (c) =>
       (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)));
+
+// Where a walk was: a walk's details.route is a saved walk's name or a place typed in
+const savedWalksOf = (store) => (Array.isArray(store.settings.walks) ? store.settings.walks : []);
+const sameName = (a, b) => String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+// What to store for a place: a saved walk's own spelling if it is one, else what was typed
+function placeOf(store, text) {
+  const t = String(text || "").trim();
+  const w = t && savedWalksOf(store).find((x) => sameName(x.name, t));
+  return w ? w.name : t;
+}
+// "Add to my walks" when logging a walk somewhere new. Saved walks need signal; the walk is logged either way
+async function addSavedWalk(store, name, mins) {
+  const all = savedWalksOf(store);
+  const n = String(name || "").trim();
+  if (!n || all.some((w) => sameName(w.name, n))) return;
+  const row = { id: uuid(), name: n, mins: Math.max(5, Math.round(Number(mins)) || 30), tide: "any", muddy: false, exposed: false, shady: false, daylight: false };
+  if (await store.setSetting("walks", [...all, row])) toast(`${n} added to your walks`);
+}
 
 function readJSON(key) { try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; } }
 function writeJSON(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* storage full or blocked */ } }
@@ -1024,6 +1042,47 @@ function Choices({ label, options, value, onChange, wrap = true }) {
   );
 }
 
+// Where a walk was: one of the saved walks, or somewhere else typed in, with a tick box to
+// add a new place to the saved walks. value is the text; keep is the tick box.
+const SOMEWHERE_ELSE = "somewhere-else";
+function WherePicker({ store, value, onChange, keep, onKeep }) {
+  const walks = savedWalksOf(store);
+  const text = String(value || "");
+  const saved = text.trim() ? walks.find((w) => sameName(w.name, text)) : null;
+  const [typing, setTyping] = useState(() => !!text.trim() && !saved);
+  const showInput = typing || walks.length === 0;
+  // Places typed before, offered as suggestions
+  const before = useMemo(() => [...new Set(store.logs
+    .filter((l) => l.kind === "walk" && l.details && typeof l.details.route === "string" && l.details.route.trim())
+    .map((l) => l.details.route.trim()))].filter((n) => !walks.some((w) => sameName(w.name, n))), [store.logs, walks]);
+  const pick = (key) => {
+    if (key === SOMEWHERE_ELSE) { setTyping(!typing); onChange(""); return; }
+    setTyping(false);
+    onChange(saved && saved.name === key ? "" : key);
+  };
+  return (
+    <>
+      {walks.length > 0 && (
+        <Choices label="Where (optional)" options={[...walks.map((w) => ({ key: w.name, label: w.name })), { key: SOMEWHERE_ELSE, label: "Somewhere else" }]}
+          value={typing ? SOMEWHERE_ELSE : saved ? saved.name : null} onChange={pick} />
+      )}
+      {showInput && (
+        <Field label={walks.length ? "Where did you go?" : "Where (optional)"} id="walk-where">
+          <input id="walk-where" className="input" list="walk-places" autoComplete="off" value={text} onChange={(e) => onChange(e.target.value)} placeholder="For example, the park by the station" />
+          <datalist id="walk-places">{before.map((n) => <option key={n} value={n} />)}</datalist>
+        </Field>
+      )}
+      {showInput && text.trim() && !saved && (
+        <label className="toggle">
+          <input type="checkbox" checked={!!keep} onChange={(e) => onKeep(e.target.checked)} />
+          <span className="toggle-ui" aria-hidden="true" />
+          <span className="log-main"><span>Add to my walks</span><span className="log-sub">So the Walks tab can suggest it</span></span>
+        </label>
+      )}
+    </>
+  );
+}
+
 function ConfirmButton({ label, confirmLabel, onConfirm }) {
   const [armed, setArmed] = useState(false);
   useEffect(() => { if (!armed) return undefined; const t = setTimeout(() => setArmed(false), 4000); return () => clearTimeout(t); }, [armed]);
@@ -1278,6 +1337,7 @@ function WalksScreen({ store, open, onLogged, wx, tides }) {
           <p className="block-note">Tell the app where you walk Barney, and it suggests which of your walks suits the weather and the tide.</p>
           <button type="button" className="btn btn-primary btn-block" onClick={() => open({ type: "area" })}>Set your area</button>
         </section>
+        <WalkHistory store={store} open={open} />
       </main>
     );
   }
@@ -1331,6 +1391,8 @@ function WalksScreen({ store, open, onLogged, wx, tides }) {
         <button type="button" className="btn btn-quiet btn-block" onClick={() => open({ type: "walkEdit" })}><Icon name="plus" size={20} /> Add a walk</button>
       </section>
 
+      <WalkHistory store={store} open={open} />
+
       <section className="block">
         <ul className="list settings">
           <li className="setting">
@@ -1345,6 +1407,79 @@ function WalksScreen({ store, open, onLogged, wx, tides }) {
         </p>
       </section>
     </main>
+  );
+}
+
+// Walk history: how often you've been to each place lately, then every walk and daycare day
+// that's loaded (the last 60 days), newest first. Daycare days come from the plans too, as
+// they count as walked, unless a daycare day was logged that day.
+const timesText = (n) => (n === 1 ? "Once" : n === 2 ? "Twice" : `${n} times`);
+function WalkHistory({ store, open }) {
+  const [all, setAll] = useState(false);
+  const today = todayKey();
+  const logs = store.logs.filter((l) => l.kind === "walk" || l.kind === "daycare");
+  const daycareLogged = new Set(logs.filter((l) => l.kind === "daycare").map((l) => dayKey(new Date(l.at))));
+  const planDays = new Set();
+  const planned = store.plans
+    .filter((p) => p.place === "daycare" && p.day <= today && !daycareLogged.has(p.day))
+    .filter((p) => (planDays.has(p.day) ? false : (planDays.add(p.day), true)));
+  const rows = [
+    ...logs.map((l) => ({ key: l.id, t: new Date(l.at).getTime(), log: l })),
+    ...planned.map((p) => ({ key: `plan-${p.id}`, t: new Date(`${p.day}T${(p.start_time || "09:00").slice(0, 5)}:00`).getTime(), plan: p })),
+  ].sort((a, b) => b.t - a.t);
+
+  // Times at each place in the last 30 days, with walks that didn't say where at the end
+  const since = Date.now() - 30 * 86400000;
+  const tally = new Map();
+  let unsaid = 0;
+  for (const l of logs) {
+    if (l.kind !== "walk" || new Date(l.at).getTime() < since) continue;
+    const name = placeOf(store, l.details && l.details.route);
+    if (!name) { unsaid++; continue; }
+    const k = name.toLowerCase();
+    tally.set(k, { name: (tally.get(k) || {}).name || name, n: ((tally.get(k) || {}).n || 0) + 1 });
+  }
+  const places = [...tally.values()].sort((a, b) => b.n - a.n || a.name.localeCompare(b.name));
+  const LIMIT = 10;
+  const shown = all ? rows : rows.slice(0, LIMIT);
+
+  return (
+    <section className="block">
+      <h2>Walk history</h2>
+      {rows.length === 0 ? <Empty>Walks you log show up here.</Empty> : (
+        <>
+          {places.length > 0 && (
+            <>
+              <p className="block-note">Where you've been in the last 30 days</p>
+              <ul className="list tally">
+                {places.map((p) => (
+                  <li key={p.name} className="tally-row"><span className="tally-name">{p.name}</span><span className="tally-n">{timesText(p.n)}</span></li>
+                ))}
+                {unsaid > 0 && <li className="tally-row is-unsaid"><span className="tally-name">Didn't say where</span><span className="tally-n">{timesText(unsaid)}</span></li>}
+              </ul>
+            </>
+          )}
+          <ul className={`list ${places.length ? "tally-after" : ""}`}>
+            {shown.map((r) => r.log
+              ? <LogRow key={r.key} store={store} log={r.log} showDay onOpen={(log) => open({ type: "log", kind: log.kind, log })} />
+              : (
+                <li key={r.key}>
+                  <button type="button" className="log-row" onClick={() => open({ type: "plan", plan: r.plan })}>
+                    <span className="log-icon log-icon-walks"><Icon name="daycare" size={22} /></span>
+                    <span className="log-main">
+                      <span className="log-title">{daycareName(store, r.plan.daycare) ? `Day at ${daycareName(store, r.plan.daycare)}` : "Day at doggy daycare"}</span>
+                      <span className="log-sub">From the plans</span>
+                    </span>
+                    <span className="log-meta"><span>{shortDate(parseDay(r.plan.day))}</span></span>
+                  </button>
+                </li>
+              ))}
+          </ul>
+          {rows.length > LIMIT && <button type="button" className="link-more" onClick={() => setAll(!all)}>{all ? "Show fewer" : `Show all ${rows.length}`}</button>}
+          <p className="fineprint">Showing the last {store.days} days.</p>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -2082,13 +2217,16 @@ function defaultsFor(kind) {
   }
 }
 
-function LogSheet({ store, kind, log, onClose }) {
+function LogSheet({ store, kind, log, preset, onClose }) {
   const k = KIND[kind];
   const editing = !!log;
   const dateOnly = ["flea", "worm", "weight"].includes(kind);
   const initial = log ? new Date(log.at) : new Date();
   const [when, setWhen] = useState(dateOnly ? dayKey(initial) : toLocalInput(initial));
   const [d, setD] = useState(() => ({ ...defaultsFor(kind), ...((log && log.details) || {}) }));
+  // Walks: where, carried over from the walk sheet when it opened this
+  const [where, setWhere] = useState(() => (log && log.details && typeof log.details.route === "string" ? log.details.route : (preset && preset.where) || ""));
+  const [keep, setKeep] = useState(() => !!(preset && preset.keep));
   const [note, setNote] = useState((log && log.note) || "");
   const [ateWhen, setAteWhen] = useState(() => (log && log.details && log.details.eaten_at ? toLocalInput(new Date(log.details.eaten_at)) : ""));
   const set = (patch) => setD((x) => ({ ...x, ...patch }));
@@ -2108,7 +2246,11 @@ function LogSheet({ store, kind, log, onClose }) {
   const clean = () => {
     const out = { ...d };
     if (kind === "weight") out.kg = Number(d.kg);
-    if (kind === "walk") { out.mins = Number(d.mins); out.distance = String(d.distance || "").trim(); }
+    if (kind === "walk") {
+      out.mins = Number(d.mins); out.distance = String(d.distance || "").trim();
+      const route = placeOf(store, where);
+      if (route) out.route = route; else delete out.route;
+    }
     if (kind === "med") { out.name = String(d.name).trim(); out.dose = String(d.dose || "").trim(); }
     if (kind === "fed") {
       const t = ateWhen ? new Date(ateWhen) : null;
@@ -2119,13 +2261,15 @@ function LogSheet({ store, kind, log, onClose }) {
   const save = (e) => {
     e.preventDefault();
     if (!valid) return;
+    const details = clean();
     if (editing) {
-      store.updateLog(log.id, { at: atISO(), details: clean(), note: note.trim() });
+      store.updateLog(log.id, { at: atISO(), details, note: note.trim() });
       toast("Changes saved");
     } else {
-      store.addLog(kind, clean(), { at: atISO(), note: note.trim() });
+      store.addLog(kind, details, { at: atISO(), note: note.trim() });
       toast(`${k.title} logged`);
     }
+    if (kind === "walk" && keep && details.route) addSavedWalk(store, details.route, details.mins);
     onClose();
   };
   const remove = () => { store.deleteLog(log.id); toast("Entry deleted"); onClose(); };
@@ -2146,9 +2290,10 @@ function LogSheet({ store, kind, log, onClose }) {
         )}
         {kind === "walk" && (
           <>
+            <WherePicker store={store} value={where} onChange={setWhere} keep={keep} onKeep={setKeep} />
             <Choices label="How long" options={WALK_MINS.map((m) => ({ key: m, label: `${m} min` }))} value={Number(d.mins)} onChange={(v) => set({ mins: v })} />
             <Field label="Or minutes" id="walk-mins"><input id="walk-mins" className="input input-short" type="number" inputMode="numeric" min="1" value={d.mins} onChange={(e) => set({ mins: e.target.value })} /></Field>
-            <Field label="Distance (optional)" id="walk-dist"><input id="walk-dist" className="input" placeholder="For example, 3 km round the park" value={d.distance || ""} onChange={(e) => set({ distance: e.target.value })} /></Field>
+            <Field label="Distance (optional)" id="walk-dist"><input id="walk-dist" className="input" placeholder="For example, 3 km" value={d.distance || ""} onChange={(e) => set({ distance: e.target.value })} /></Field>
           </>
         )}
         {kind === "weight" && (
@@ -2219,23 +2364,26 @@ function EatenSheet({ store, log, onClose, onLogged }) {
 }
 
 function WalkSheet({ store, onClose, onLogged, openDetails, onDone }) {
-  const walks = Array.isArray(store.settings.walks) ? store.settings.walks : [];
-  const [route, setRoute] = useState(null);
+  const [where, setWhere] = useState("");
+  const [keep, setKeep] = useState(false);
   const log = (kind, details) => {
     const row = store.addLog(kind, details);
     onLogged(row);
     if (onDone) onDone();
     onClose();
   };
+  const logWalk = (mins) => {
+    const route = placeOf(store, where);
+    log("walk", route ? { mins, distance: "", route } : { mins, distance: "" });
+    if (route && keep) addSavedWalk(store, route, mins);
+  };
   return (
     <Sheet title="How long was the walk?" onClose={onClose}>
       <div className="sheet-body">
-        {walks.length > 0 && (
-          <Choices label="Which walk (optional)" options={walks.map((w) => ({ key: w.name, label: w.name }))} value={route} onChange={(v) => setRoute(route === v ? null : v)} />
-        )}
+        <WherePicker store={store} value={where} onChange={setWhere} keep={keep} onKeep={setKeep} />
         <div className="minutes">
           {WALK_MINS.map((m) => (
-            <button key={m} type="button" className="minute" onClick={() => log("walk", route ? { mins: m, distance: "", route } : { mins: m, distance: "" })}>
+            <button key={m} type="button" className="minute" onClick={() => logWalk(m)}>
               <b>{m}</b><span>minutes</span>
             </button>
           ))}
@@ -2250,7 +2398,7 @@ function WalkSheet({ store, onClose, onLogged, openDetails, onDone }) {
             </button>
           );
         })()}
-        <button type="button" className="link-more" onClick={openDetails}>Add a distance, note or earlier time</button>
+        <button type="button" className="link-more" onClick={() => openDetails({ where, keep })}>Add a distance, note or earlier time</button>
       </div>
     </Sheet>
   );
@@ -2963,14 +3111,14 @@ function Main({ session }) {
     switch (sheet.type) {
       case "log": {
         const live = sheet.log ? store.logs.find((l) => l.id === sheet.log.id) : null;
-        sheetEl = sheet.log && !live ? null : <LogSheet key={(sheet.log && sheet.log.id) || sheet.kind} store={store} kind={sheet.kind} log={live} onClose={close} />;
+        sheetEl = sheet.log && !live ? null : <LogSheet key={(sheet.log && sheet.log.id) || sheet.kind} store={store} kind={sheet.kind} log={live} preset={sheet.preset} onClose={close} />;
         break;
       }
       case "eaten":
         sheetEl = <EatenSheet key={sheet.log.id} store={store} log={sheet.log} onClose={close} onLogged={onLogged} />;
         break;
       case "walk":
-        sheetEl = <WalkSheet store={store} onClose={close} onLogged={onLogged} onDone={sheet.onDone} openDetails={() => setSheet({ type: "log", kind: "walk" })} />;
+        sheetEl = <WalkSheet store={store} onClose={close} onLogged={onLogged} onDone={sheet.onDone} openDetails={(preset) => setSheet({ type: "log", kind: "walk", preset })} />;
         break;
       case "add":
         sheetEl = <AddSheet onClose={close} pick={(kind) => setSheet({ type: "log", kind })} />;

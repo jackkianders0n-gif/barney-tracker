@@ -194,6 +194,13 @@ code { font-size: .9em; background: var(--apricot-soft); padding: 1px 6px; borde
 .log-who { font-size: 13px; font-weight: 600; color: var(--tan-ink); }
 .row-chevron { color: var(--line-strong); flex-shrink: 0; }
 
+/* Walk history: times at each place */
+.tally-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 10px 14px; }
+.tally-name { font-weight: 600; color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+.tally-n { font-size: 14px; color: var(--ink-soft); white-space: nowrap; }
+.tally-row.is-unsaid .tally-name { font-weight: 400; color: var(--ink-soft); }
+.tally-after { margin-top: 12px; }
+
 .empty { display: flex; align-items: center; gap: 8px; color: var(--ink-soft); padding: 4px 2px 0; }
 .empty svg { color: var(--tan); flex-shrink: 0; }
 .link-more {
